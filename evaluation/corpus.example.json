@@ -1,0 +1,43 @@
+{
+  "schemaVersion": "1.0",
+  "cases": [
+    {
+      "id": "synthetic-conflict",
+      "label": "severe_conflict",
+      "replies": [
+        {
+          "id": "c1",
+          "author": "用户甲",
+          "content": "我觉得这集的节奏不太好。",
+          "time": "2026-07-22 12:00"
+        },
+        {
+          "id": "c2",
+          "author": "用户乙",
+          "content": "回复 @用户甲：不会真有人连这都看不懂吧，你这个傻逼废物就别来对线。",
+          "parentId": "c1",
+          "time": "2026-07-22 12:02"
+        }
+      ]
+    },
+    {
+      "id": "synthetic-normal",
+      "label": "normal_discussion",
+      "replies": [
+        {
+          "id": "n1",
+          "author": "用户丙",
+          "content": "我更喜欢这一集的摄影，但同意文戏稍慢。",
+          "time": "2026-07-22 13:00"
+        },
+        {
+          "id": "n2",
+          "author": "用户丁",
+          "content": "我的看法相反，不过你提到的摄影角度很有意思。",
+          "parentId": "n1",
+          "time": "2026-07-22 13:05"
+        }
+      ]
+    }
+  ]
+}

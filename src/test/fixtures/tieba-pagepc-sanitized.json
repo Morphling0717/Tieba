@@ -1,0 +1,93 @@
+{
+  "error_code": "0",
+  "thread": {
+    "id": "99000000001",
+    "title": "脱敏测试帖",
+    "reply_num": "4"
+  },
+  "forum": {
+    "id": "123",
+    "name": "测试"
+  },
+  "page": {
+    "current_page": "1",
+    "total_page": "2",
+    "has_more": "1",
+    "has_prev": "0"
+  },
+  "first_floor": {
+    "id": "990100000001",
+    "tid": "99000000001",
+    "author_id": "10001",
+    "floor": "1",
+    "time": "1784682000",
+    "title": "脱敏测试帖",
+    "content": [
+      {
+        "type": "0",
+        "text": "主楼正文"
+      },
+      {
+        "type": "3",
+        "origin_src": "https://example.invalid/redacted-main.jpg"
+      }
+    ],
+    "sub_post_number": "0"
+  },
+  "post_list": [
+    {
+      "id": "990100000002",
+      "author_id": "10002",
+      "floor": "2",
+      "time": "1784682060",
+      "content": [
+        {
+          "type": "0",
+          "text": "普通回复"
+        },
+        {
+          "type": "4",
+          "text": "@用户丙"
+        },
+        {
+          "type": "2",
+          "c": "[表情]"
+        }
+      ],
+      "sub_post_number": "3",
+      "sub_post_list": {
+        "pid": "990100000002",
+        "sub_post_list": [
+          {
+            "id": "990100100001",
+            "author_id": "10003",
+            "time": "1784682120",
+            "content": [
+              {
+                "type": "0",
+                "text": "楼中楼预览"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "user_list": [
+    {
+      "id": "10001",
+      "name": "redacted-a",
+      "name_show": "楼主甲"
+    },
+    {
+      "id": "10002",
+      "name": "redacted-b",
+      "name_show": "用户乙"
+    },
+    {
+      "id": "10003",
+      "name": "redacted-c",
+      "name_show": "用户丙"
+    }
+  ]
+}

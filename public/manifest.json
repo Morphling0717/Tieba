@@ -1,0 +1,36 @@
+{
+  "manifest_version": 3,
+  "name": "假面骑士吧长帖审阅助手",
+  "description": "读取长帖的楼层与楼中楼，由用户配置的 AI 模型生成可定位的审阅线索并匹配规范理由。所有管理操作均由吧务人工完成。",
+  "version": "0.3.1",
+  "minimum_chrome_version": "116",
+  "permissions": ["scripting", "storage", "sidePanel"],
+  "host_permissions": [
+    "https://tieba.baidu.com/*",
+    "https://ws-7ee35od4h2zs6dft.cn-beijing.maas.aliyuncs.com/*"
+  ],
+  "optional_host_permissions": [
+    "https://api.deepseek.com/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "打开长帖审阅助手"
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Alt+Shift+Y",
+        "mac": "Command+Shift+Y"
+      },
+      "description": "打开长帖审阅助手"
+    }
+  },
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  }
+}

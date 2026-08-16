@@ -203,6 +203,24 @@ describe("SPA evidence helpers", () => {
     expect(isSelectedSortControl(control!)).toBe(true);
   });
 
+  it("recognizes the current Tieba div-based ascending tab", () => {
+    const document = documentFrom(`
+      <div class="pc-pb-comments">
+        <div class="pc-pb-reply-top">
+          <div class="sub-tab-list">
+            <div class="sub-tab-item sub-tab-item-active">热门</div>
+            <div id="ascending" class="sub-tab-item"><span>正序</span></div>
+            <div class="sub-tab-item">倒序</div>
+          </div>
+        </div>
+      </div>
+    `);
+
+    const control = findTiebaAscendingSortControl(document);
+    expect(control).toBe(document.querySelector("#ascending"));
+    expect(isSelectedSortControl(control!)).toBe(false);
+  });
+
   it("does not treat reply body text or a navigating link as a sort control", () => {
     const bodyOnly = documentFrom(
       `<section class="pc-pb-comments"><div class="pb-comment-item"><div role="tablist"><button role="tab">正序</button></div></div></section>`,

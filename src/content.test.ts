@@ -51,7 +51,6 @@ async function loadContent(): Promise<ContentListener> {
 function dispatchJump(
   listener: ContentListener,
   locator: EvidenceLocator,
-  waitForOfficialRoute = false,
   expectedThreadId = "123",
 ): Promise<ExtensionResponse> {
   return new Promise((resolve) => {
@@ -60,7 +59,6 @@ function dispatchJump(
         type: "JUMP_TO_REPLY",
         locator,
         expectedThreadId,
-        waitForOfficialRoute,
       },
       {} as chrome.runtime.MessageSender,
       resolve,
@@ -73,15 +71,16 @@ describe("in-page evidence navigation", () => {
     window.history.replaceState({}, "", "/p/123");
   });
 
-  it("still scans in-page when an ordinary click happens to share the current PID URL", async () => {
+  it("uses Tieba's div-based ascending tab without changing the page URL", async () => {
     window.history.replaceState({}, "", "/p/123?pid=101");
+    const initialUrl = window.location.href;
     document.body.innerHTML = `
       <section class="pc-pb-comments">
         <div class="pc-pb-reply-top">全部回复（268）
-          <div role="tablist">
-            <button role="tab" aria-selected="true">热门</button>
-            <button id="ascending" role="tab">正序</button>
-            <button role="tab">倒序</button>
+          <div class="sub-tab-list">
+            <div class="sub-tab-item sub-tab-item-active">热门</div>
+            <div id="ascending" class="sub-tab-item">正序</div>
+            <div class="sub-tab-item">倒序</div>
           </div>
         </div>
         <div class="pc-pb-reply-list"><div class="thread-container"></div></div>
@@ -100,6 +99,7 @@ describe("in-page evidence navigation", () => {
       data: true,
     });
     expect(click).toHaveBeenCalledTimes(1);
+    expect(window.location.href).toBe(initialUrl);
   });
 
   it("locates the parent, expands a nested read control, and verifies the child id", async () => {
@@ -138,29 +138,6 @@ describe("in-page evidence navigation", () => {
     expect(click).toHaveBeenCalledTimes(1);
   });
 
-  it("waits for the official PID route only when the background marks a pending resume", async () => {
-    window.history.replaceState({}, "", "/p/123?pid=101");
-    document.body.innerHTML = `
-      <section class="pc-pb-comments">
-        <div class="pc-pb-reply-top"><button id="ascending" role="tab">正序</button></div>
-        <div class="pc-pb-reply-list"><div class="thread-container"></div></div>
-      </section>
-    `;
-    const sortClick = vi.fn();
-    document.querySelector("#ascending")!.addEventListener("click", sortClick);
-    const listener = await loadContent();
-    window.setTimeout(() => {
-      document.querySelector(".thread-container")!.innerHTML =
-        '<div class="pb-comment-item" data-id="101">官方路由挂载的目标</div>';
-    }, 80);
-
-    await expect(dispatchJump(listener, mainLocator(), true)).resolves.toEqual({
-      ok: true,
-      data: true,
-    });
-    expect(sortClick).not.toHaveBeenCalled();
-  });
-
   it("never double-clicks one unchanged expansion control", async () => {
     document.body.innerHTML = `
       <section class="pc-pb-comments"><div class="pc-pb-reply-list">
@@ -173,6 +150,7 @@ describe("in-page evidence navigation", () => {
     const click = vi.fn();
     more.addEventListener("click", click);
     const listener = await loadContent();
+    const initialUrl = window.location.href;
     const response = await dispatchJump(
       listener,
       mainLocator({
@@ -188,6 +166,7 @@ describe("in-page evidence navigation", () => {
 
     expect(response).toMatchObject({ ok: false, code: "EVIDENCE_NOT_LOADED" });
     expect(click).toHaveBeenCalledTimes(1);
+    expect(window.location.href).toBe(initialUrl);
   });
 
   it("does not click a moderation control whose visible words resemble expansion", async () => {
@@ -265,7 +244,7 @@ describe("in-page evidence navigation", () => {
     const listener = await loadContent();
 
     await expect(
-      dispatchJump(listener, mainLocator(), false, "123"),
+      dispatchJump(listener, mainLocator(), "123"),
     ).resolves.toMatchObject({ ok: false, code: "SESSION_STALE" });
     expect(sortClick).not.toHaveBeenCalled();
     expect(expandClick).not.toHaveBeenCalled();

@@ -8,8 +8,10 @@ coverage/
 !.env.example
 *.pem
 *.key
+api key*.txt
 *.crx
 *.zip
+release/
 .idea/
 .vscode/
 evaluation/private/

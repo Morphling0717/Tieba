@@ -45,11 +45,7 @@ const PARSE_POLL_MS = 125;
 const DYNAMIC_DEBOUNCE_MS = 750;
 const IDENTITY_WATCH_INTERVAL_MS = 250;
 const DYNAMIC_ROOT_WAIT_MS = 1_000;
-// Tieba reports the document complete before its PID-targeted CSR window is
-// necessarily mounted. Real pages can take about three seconds, especially
-// after leaving the reverse list, so keep the pending jump alive long enough
-// for the official route to render and highlight the target.
-const VIRTUAL_MOUNT_WAIT_MS = 5_000;
+// Allow short same-document SPA mounts after sorting, scrolling or expansion.
 const IN_PAGE_MOUNT_WAIT_MS = 650;
 const SORT_SETTLE_MS = 450;
 const SCAN_SETTLE_MS = 225;
@@ -570,24 +566,6 @@ if (!window.__KR_TIEBA_REVIEWER_CONTENT__) {
     }
   }
 
-  function targetedByOfficialRoute(locator: EvidenceLocator): boolean {
-    try {
-      const url = new URL(window.location.href);
-      const pid = url.searchParams.get("pid");
-      const cid = url.searchParams.get("cid");
-      if (locator.isNested) {
-        return (
-          pid !== null &&
-          pid === locator.parentSiteReplyId &&
-          (!locator.siteReplyId || cid === locator.siteReplyId)
-        );
-      }
-      return pid !== null && pid === locator.siteReplyId;
-    } catch {
-      return false;
-    }
-  }
-
   async function tryMountedPlaceholder(
     locator: EvidenceLocator,
     expectedThreadId: string,
@@ -615,22 +593,10 @@ if (!window.__KR_TIEBA_REVIEWER_CONTENT__) {
     locator: EvidenceLocator,
     expectedThreadId: string,
     generation: number,
-    waitForOfficialRoute: boolean,
   ): Promise<Element | null> {
     if (!jumpStillOnThread(expectedThreadId, generation)) return null;
     let target = currentTarget(locator, expectedThreadId, generation);
     if (target) return target;
-
-    // After the background uses Tieba's official PID/CID route, let that route
-    // finish mounting before touching the sort or scroll state again.
-    if (waitForOfficialRoute && targetedByOfficialRoute(locator)) {
-      return waitForMountedEvidence(
-        locator,
-        VIRTUAL_MOUNT_WAIT_MS,
-        expectedThreadId,
-        generation,
-      );
-    }
 
     target = await tryMountedPlaceholder(locator, expectedThreadId, generation);
     if (target || !jumpStillOnThread(expectedThreadId, generation)) return target;
@@ -817,7 +783,6 @@ if (!window.__KR_TIEBA_REVIEWER_CONTENT__) {
   async function jumpToEvidence(
     locator: EvidenceLocator,
     generation: number,
-    waitForOfficialRoute: boolean,
     expectedThreadId: string,
   ): Promise<ExtensionResponse<boolean>> {
     if (
@@ -856,7 +821,6 @@ if (!window.__KR_TIEBA_REVIEWER_CONTENT__) {
             parentLocator,
             expectedThreadId,
             generation,
-            waitForOfficialRoute,
           )
         : null;
       if (jumpWasCancelled(generation)) return cancelledJump();
@@ -865,7 +829,7 @@ if (!window.__KR_TIEBA_REVIEWER_CONTENT__) {
       }
       if (!parent) {
         return failure(
-          "这条楼中楼的父楼尚未加载，将尝试通过贴吧官方回复地址定位。",
+          "这条楼中楼的父楼尚未加载。为避免刷新页面，已停留在当前帖子；请继续滚动后再试。",
           "EVIDENCE_NOT_LOADED",
         );
       }
@@ -890,7 +854,7 @@ if (!window.__KR_TIEBA_REVIEWER_CONTENT__) {
         return { ok: true, data: true };
       }
       return failure(
-        "已定位父楼并尝试展开楼中楼，但目标仍未加载；将尝试贴吧官方回复地址。",
+        "已定位父楼并尝试展开楼中楼，但目标仍未加载。为避免刷新页面，已停留在当前位置。",
         "EVIDENCE_NOT_LOADED",
       );
     }
@@ -899,7 +863,6 @@ if (!window.__KR_TIEBA_REVIEWER_CONTENT__) {
       locator,
       expectedThreadId,
       generation,
-      waitForOfficialRoute,
     );
     if (jumpWasCancelled(generation)) return cancelledJump();
     if (!jumpStillOnThread(expectedThreadId, generation)) {
@@ -911,7 +874,7 @@ if (!window.__KR_TIEBA_REVIEWER_CONTENT__) {
     }
 
     return failure(
-      "这条回复尚未加载到当前页面，将尝试通过贴吧官方回复地址定位。",
+      "这条回复尚未加载到当前页面。为避免刷新页面，已停留在当前帖子；请继续滚动后再试。",
       "EVIDENCE_NOT_LOADED",
     );
   }
@@ -989,7 +952,6 @@ if (!window.__KR_TIEBA_REVIEWER_CONTENT__) {
         void jumpToEvidence(
           message.locator,
           generation,
-          message.waitForOfficialRoute === true,
           message.expectedThreadId,
         ).then(sendResponse);
         return true;

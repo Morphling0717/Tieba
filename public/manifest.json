@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
   "name": "假面骑士吧长帖审阅助手",
-  "description": "读取长帖的楼层与楼中楼，由用户配置的 AI 模型生成可定位的审阅线索并匹配规范理由。所有管理操作均由吧务人工完成。",
-  "version": "0.3.1",
-  "minimum_chrome_version": "116",
+  "description": "非百度官方的贴吧长帖人工审阅助手。读取当前帖可见文字，经用户确认后可向所选 AI 服务商发送本地脱敏内容并生成待复核线索；不执行删除或封禁。",
+  "version": "1.0.0",
+  "minimum_chrome_version": "140",
   "permissions": ["scripting", "storage", "sidePanel"],
   "host_permissions": [
     "https://tieba.baidu.com/*",

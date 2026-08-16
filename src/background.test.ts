@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
+  CaptureProgressMessage,
   ContentRequest,
   DynamicContentChangedMessage,
   ExtensionRequest,
   ExtensionResponse,
   PageIdentityChangedMessage,
 } from "./messages";
+import { isCaptureProgressMessage } from "./messages";
 import { mergeCapture, sessionStorageKey } from "./lib/session";
 import type { ReviewSession } from "./lib/session";
 import type { TiebaReadRequest } from "./lib/tiebaApi";
@@ -27,6 +29,8 @@ type UpdatedListener = (
   tab: chrome.tabs.Tab,
 ) => void;
 
+type RemovedListener = (tabId: number) => void;
+
 interface ChromeHarness {
   activeTab: chrome.tabs.Tab;
   executeScript: ReturnType<typeof vi.fn>;
@@ -36,6 +40,7 @@ interface ChromeHarness {
   storageRemove: ReturnType<typeof vi.fn>;
   storageSet: ReturnType<typeof vi.fn>;
   tabsSendMessage: ReturnType<typeof vi.fn>;
+  tabsGet: ReturnType<typeof vi.fn>;
   tabsQuery: ReturnType<typeof vi.fn>;
   tabsReload: ReturnType<typeof vi.fn>;
   tabsUpdate: ReturnType<typeof vi.fn>;
@@ -53,6 +58,7 @@ interface ChromeHarness {
     status?: "loading" | "complete" | null,
     url?: string,
   ): void;
+  removed(tabId?: number): void;
 }
 
 function capture(
@@ -180,6 +186,49 @@ function apiMainPageBody(): string {
   });
 }
 
+function successfulApiContentResponse(
+  message: ContentRequest,
+): ExtensionResponse<unknown> {
+  if (message.type === "FETCH_TIEBA_READ_API") {
+    if (message.request.endpoint === "/c/s/pc/sync") {
+      return apiResponse(
+        message.request,
+        JSON.stringify({
+          error_code: 0,
+          anti: { tbs: "0123456789abcdef0123456789abcdef" },
+        }),
+      );
+    }
+    if (message.request.endpoint === "/c/f/pb/page_pc") {
+      return apiResponse(message.request, apiMainPageBody());
+    }
+    return apiResponse(
+      message.request,
+      "<li class=\"lzl_single_post\">楼中楼</li>",
+    );
+  }
+  if (message.type === "PARSE_TIEBA_NESTED_HTML") {
+    return {
+      ok: true,
+      data: {
+        threadId: "123",
+        parentReplyId: "101",
+        parentSiteReplyId: "101",
+        currentPage: 1,
+        totalPages: 1,
+        totalNum: 1,
+        hasMore: false,
+        unparsedReplyCount: 0,
+        replies: [],
+      },
+    };
+  }
+  if (message.type === "GET_PAGE_URL") {
+    return { ok: true, data: "https://tieba.baidu.com/p/123" };
+  }
+  throw new Error(`unexpected content message: ${message.type}`);
+}
+
 async function createHarness(
   tabOverrides: Partial<chrome.tabs.Tab> = {},
 ): Promise<ChromeHarness> {
@@ -198,9 +247,13 @@ async function createHarness(
   const storage = new Map<string, unknown>();
   let runtimeListener: RuntimeListener | undefined;
   let updatedListener: UpdatedListener | undefined;
+  let removedListener: RemovedListener | undefined;
 
   const executeScript = vi.fn();
   const tabsSendMessage = vi.fn();
+  const tabsGet = vi.fn(async (tabId: number) =>
+    tabId === activeTab.id ? activeTab : Promise.reject(new Error("tab not found")),
+  );
   const tabsQuery = vi.fn().mockResolvedValue([activeTab]);
   const tabsReload = vi.fn().mockResolvedValue(undefined);
   const tabsUpdate = vi.fn().mockResolvedValue(activeTab);
@@ -237,6 +290,7 @@ async function createHarness(
       },
     },
     tabs: {
+      get: tabsGet,
       query: tabsQuery,
       sendMessage: tabsSendMessage,
       reload: tabsReload,
@@ -246,13 +300,17 @@ async function createHarness(
           updatedListener = listener;
         }),
       },
-      onRemoved: { addListener: vi.fn() },
+      onRemoved: {
+        addListener: vi.fn((listener: RemovedListener) => {
+          removedListener = listener;
+        }),
+      },
     },
   };
 
   vi.stubGlobal("chrome", chromeMock as unknown as typeof chrome);
   await import("./background");
-  if (!runtimeListener || !updatedListener) {
+  if (!runtimeListener || !updatedListener || !removedListener) {
     throw new Error("后台脚本未注册必要的 Chrome 事件监听器");
   }
 
@@ -265,6 +323,7 @@ async function createHarness(
     storageRemove,
     storageSet,
     tabsSendMessage,
+    tabsGet,
     tabsQuery,
     tabsReload,
     tabsUpdate,
@@ -336,6 +395,9 @@ async function createHarness(
         { ...(status ? { status } : {}), ...(url ? { url } : {}) },
         tab,
       );
+    },
+    removed(tabId = activeTab.id!) {
+      removedListener!(tabId);
     },
   };
 }
@@ -679,7 +741,13 @@ describe("explicit whole-thread API capture", () => {
               totalPages: 1,
               totalNum: 1,
               hasMore: false,
+              rawReplyNodeCount: 1,
+              stableReplyOccurrenceCount: 1,
+              duplicateStableIdCount: 0,
               unparsedReplyCount: 0,
+              unknownStructureCount: 0,
+              hasTrustedPager: true,
+              isOutOfRangeEmptyProbe: false,
               replies: [
                 {
                   id: "201",
@@ -847,9 +915,16 @@ describe("explicit whole-thread API capture", () => {
     expect(response).toMatchObject({
       ok: true,
       data: {
-        coverage: { captureMode: "paginated" },
+        coverage: {
+          captureMode: "paginated",
+          dynamicContentMayRemain: true,
+          isComplete: false,
+        },
+        errors: [
+          expect.stringContaining("整帖只读接口失败"),
+        ],
         warnings: [
-          expect.stringContaining("当前结果仅来自页面已挂载内容"),
+          expect.stringContaining("不是完整帖子快照"),
         ],
       },
     });
@@ -859,6 +934,442 @@ describe("explicit whole-thread API capture", () => {
           (message as ContentRequest).type === "FETCH_TIEBA_READ_API",
       ),
     ).toHaveLength(1);
+  });
+
+  it("reports both the read-endpoint and page-parser failures when fallback also fails", async () => {
+    const harness = await createHarness({
+      url: "https://tieba.baidu.com/p/123",
+    });
+    harness.executeScript.mockResolvedValue([{ frameId: 0 }]);
+    harness.tabsSendMessage.mockImplementation(
+      async (_tabId: number, message: ContentRequest) => {
+        if (message.type === "FETCH_TIEBA_READ_API") {
+          return {
+            ok: false,
+            code: "TIEBA_READ_API_FAILED",
+            error: "同步端点超时",
+          };
+        }
+        if (message.type === "PARSE_TIEBA_PAGE") {
+          return {
+            ok: false,
+            code: "PAGE_LAYOUT_UNSUPPORTED",
+            error: "新版页面结构无法识别",
+          };
+        }
+        throw new Error(`unexpected fallback message: ${message.type}`);
+      },
+    );
+
+    await expect(
+      harness.dispatch({ type: "CAPTURE_WHOLE_THREAD" }),
+    ).resolves.toMatchObject({
+      ok: false,
+      code: "PAGE_LAYOUT_UNSUPPORTED",
+      error: expect.stringMatching(/同步端点超时.*新版页面结构无法识别/u),
+    });
+    expect(harness.storage.has(sessionStorageKey(42))).toBe(false);
+  });
+});
+
+describe("tab review workspaces and capture progress", () => {
+  it("returns a null workspace for an ordinary inactive tab without treating it as an error", async () => {
+    const harness = await createHarness({
+      url: "https://tieba.baidu.com/p/123",
+    });
+    const ordinaryTab = {
+      ...harness.activeTab,
+      id: 99,
+      active: false,
+      selected: false,
+      url: "https://example.com/ordinary-page",
+    } as chrome.tabs.Tab;
+    harness.tabsGet.mockImplementation(async (tabId: number) => {
+      if (tabId === 99) return ordinaryTab;
+      return harness.activeTab;
+    });
+
+    await expect(
+      harness.dispatch({ type: "GET_TAB_REVIEW_CONTEXT", tabId: 99 }),
+    ).resolves.toEqual({
+      ok: true,
+      data: {
+        tabId: 99,
+        url: "https://example.com/ordinary-page",
+        threadId: null,
+        session: null,
+        captureProgress: null,
+      },
+    });
+    expect(harness.tabsQuery).not.toHaveBeenCalled();
+    expect(harness.executeScript).not.toHaveBeenCalled();
+  });
+
+  it("loads and strictly validates an inactive tab snapshot by URL, thread and revision", async () => {
+    const harness = await createHarness({
+      url: "https://tieba.baidu.com/p/999",
+    });
+    const reviewedTab = {
+      ...harness.activeTab,
+      id: 99,
+      active: false,
+      selected: false,
+      url: "https://tieba.baidu.com/p/123?pn=2",
+    } as chrome.tabs.Tab;
+    const saved = session(99);
+    harness.storage.set(sessionStorageKey(99), saved);
+    harness.tabsGet.mockImplementation(async (tabId: number) => {
+      if (tabId === 99) return reviewedTab;
+      return harness.activeTab;
+    });
+    harness.executeScript.mockImplementation(
+      async (details: Record<string, unknown>) =>
+        "func" in details
+          ? [{ frameId: 0, result: reviewedTab.url }]
+          : [{ frameId: 0 }],
+    );
+
+    await expect(
+      harness.dispatch({ type: "GET_TAB_REVIEW_CONTEXT", tabId: 99 }),
+    ).resolves.toMatchObject({
+      ok: true,
+      data: {
+        tabId: 99,
+        threadId: "123",
+        session: { tabId: 99, threadId: "123" },
+      },
+    });
+    await expect(
+      harness.dispatch({
+        type: "VALIDATE_REVIEW_SNAPSHOT",
+        tabId: 99,
+        threadId: "123",
+        sessionUpdatedAt: saved.updatedAt,
+      }),
+    ).resolves.toMatchObject({
+      ok: true,
+      data: { valid: true, session: { tabId: 99, threadId: "123" } },
+    });
+    await expect(
+      harness.dispatch({
+        type: "VALIDATE_REVIEW_SNAPSHOT",
+        tabId: 99,
+        threadId: "123",
+        sessionUpdatedAt: "2026-08-16T00:00:00.000Z",
+      }),
+    ).resolves.toMatchObject({ ok: false, code: "SESSION_STALE" });
+
+    reviewedTab.url = "https://tieba.baidu.com/p/456";
+    await expect(
+      harness.dispatch({
+        type: "VALIDATE_REVIEW_SNAPSHOT",
+        tabId: 99,
+        threadId: "123",
+        sessionUpdatedAt: saved.updatedAt,
+      }),
+    ).resolves.toMatchObject({ ok: false, code: "SESSION_STALE" });
+    expect(harness.tabsQuery).not.toHaveBeenCalled();
+  });
+
+  it("keeps a requested inactive-tab capture running across active-tab switches and emits body-free progress", async () => {
+    const harness = await createHarness({
+      url: "https://tieba.baidu.com/p/999",
+    });
+    const reviewedTab = {
+      ...harness.activeTab,
+      id: 99,
+      active: false,
+      selected: false,
+      url: "https://tieba.baidu.com/p/123",
+    } as chrome.tabs.Tab;
+    harness.tabsGet.mockImplementation(async (tabId: number) => {
+      if (tabId === 99) return reviewedTab;
+      return harness.activeTab;
+    });
+    harness.executeScript.mockResolvedValue([{ frameId: 0 }]);
+    let releaseSync!: (response: ExtensionResponse<unknown>) => void;
+    let syncRequest: TiebaReadRequest | null = null;
+    harness.tabsSendMessage.mockImplementation(
+      async (tabId: number, message: ContentRequest) => {
+        expect(tabId).toBe(99);
+        if (
+          message.type === "FETCH_TIEBA_READ_API" &&
+          message.request.endpoint === "/c/s/pc/sync"
+        ) {
+          syncRequest = message.request;
+          return new Promise<ExtensionResponse<unknown>>((resolve) => {
+            releaseSync = resolve;
+          });
+        }
+        return successfulApiContentResponse(message);
+      },
+    );
+
+    const pending = harness.dispatch({
+      type: "CAPTURE_WHOLE_THREAD",
+      tabId: 99,
+      requestId: "inactive-run-1",
+    });
+    await vi.waitFor(() => expect(syncRequest).not.toBeNull());
+    await expect(
+      harness.dispatch({ type: "GET_TAB_REVIEW_CONTEXT", tabId: 99 }),
+    ).resolves.toMatchObject({
+      ok: true,
+      data: {
+        tabId: 99,
+        captureProgress: {
+          type: "CAPTURE_PROGRESS",
+          requestId: "inactive-run-1",
+          phase: "sync",
+          status: "running",
+        },
+      },
+    });
+
+    harness.tabsQuery.mockResolvedValue([
+      { ...harness.activeTab, id: 77, url: "https://example.com/other" },
+    ]);
+    releaseSync(
+      apiResponse(
+        syncRequest!,
+        JSON.stringify({
+          error_code: 0,
+          anti: { tbs: "0123456789abcdef0123456789abcdef" },
+        }),
+      ),
+    );
+
+    await expect(pending).resolves.toMatchObject({
+      ok: true,
+      data: { tabId: 99, threadId: "123", coverage: { captureMode: "api" } },
+    });
+    expect(harness.storage.get(sessionStorageKey(99))).toMatchObject({
+      tabId: 99,
+      threadId: "123",
+    });
+    expect(harness.tabsQuery).not.toHaveBeenCalled();
+
+    const progress = harness.runtimeSendMessage.mock.calls
+      .map(([message]) => message)
+      .filter(isCaptureProgressMessage) as CaptureProgressMessage[];
+    expect(progress[0]).toMatchObject({
+      tabId: 99,
+      requestId: "inactive-run-1",
+      phase: "validation",
+      completed: 0,
+      total: 1,
+      status: "running",
+    });
+    expect(progress.at(-1)).toMatchObject({
+      tabId: 99,
+      requestId: "inactive-run-1",
+      status: "complete",
+    });
+    expect(
+      progress.every((message) =>
+        isCaptureProgressMessage(message),
+      ),
+    ).toBe(true);
+    expect(JSON.stringify(progress)).not.toContain("主楼");
+    expect(JSON.stringify(progress)).not.toContain("用户");
+    expect(
+      Object.keys(progress[0]).sort(),
+    ).toEqual(
+      [
+        "completed",
+        "phase",
+        "requestId",
+        "status",
+        "tabId",
+        "total",
+        "type",
+      ].sort(),
+    );
+  });
+
+  it("cancels only the matching tab/request capture and preserves prior session data", async () => {
+    const harness = await createHarness({
+      url: "https://tieba.baidu.com/p/123",
+    });
+    const prior = session();
+    harness.storage.set(sessionStorageKey(42), prior);
+    harness.executeScript.mockResolvedValue([{ frameId: 0 }]);
+    let releaseSync!: (response: ExtensionResponse<unknown>) => void;
+    let syncRequest: TiebaReadRequest | null = null;
+    harness.tabsSendMessage.mockImplementation(
+      async (_tabId: number, message: ContentRequest) => {
+        if (
+          message.type === "FETCH_TIEBA_READ_API" &&
+          message.request.endpoint === "/c/s/pc/sync"
+        ) {
+          syncRequest = message.request;
+          return new Promise<ExtensionResponse<unknown>>((resolve) => {
+            releaseSync = resolve;
+          });
+        }
+        return successfulApiContentResponse(message);
+      },
+    );
+
+    const pending = harness.dispatch({
+      type: "CAPTURE_WHOLE_THREAD",
+      tabId: 42,
+      requestId: "cancel-me",
+    });
+    await vi.waitFor(() => expect(syncRequest).not.toBeNull());
+    await expect(
+      harness.dispatch({
+        type: "CANCEL_CAPTURE",
+        tabId: 42,
+        requestId: "older-run",
+      }),
+    ).resolves.toMatchObject({ ok: false, code: "SESSION_STALE" });
+    await expect(
+      harness.dispatch({
+        type: "CANCEL_CAPTURE",
+        tabId: 42,
+        requestId: "cancel-me",
+      }),
+    ).resolves.toEqual({ ok: true, data: null });
+    releaseSync(
+      apiResponse(
+        syncRequest!,
+        JSON.stringify({
+          error_code: 0,
+          anti: { tbs: "0123456789abcdef0123456789abcdef" },
+        }),
+      ),
+    );
+
+    await expect(pending).resolves.toMatchObject({
+      ok: false,
+      code: "CAPTURE_CANCELLED",
+    });
+    expect(harness.storage.get(sessionStorageKey(42))).toBe(prior);
+    expect(harness.runtimeSendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "CAPTURE_PROGRESS",
+        tabId: 42,
+        requestId: "cancel-me",
+        status: "cancelled",
+      }),
+    );
+  });
+
+  it("cannot save an API snapshot when explicit cancel lands after the final checkpoint", async () => {
+    const harness = await createHarness({
+      url: "https://tieba.baidu.com/p/123",
+    });
+    harness.executeScript.mockResolvedValue([{ frameId: 0 }]);
+    harness.tabsSendMessage.mockImplementation(
+      async (_tabId: number, message: ContentRequest) =>
+        successfulApiContentResponse(message),
+    );
+
+    let releaseFinalLoad!: () => void;
+    let finalLoadStarted = false;
+    const finalLoadGate = new Promise<void>((resolve) => {
+      releaseFinalLoad = resolve;
+    });
+    harness.storageGet.mockImplementation(async (key: string) => {
+      if (key === sessionStorageKey(42) && !finalLoadStarted) {
+        finalLoadStarted = true;
+        await finalLoadGate;
+      }
+      return { [key]: harness.storage.get(key) };
+    });
+
+    const pending = harness.dispatch({
+      type: "CAPTURE_WHOLE_THREAD",
+      tabId: 42,
+      requestId: "cancel-before-save",
+    });
+    await vi.waitFor(() => expect(finalLoadStarted).toBe(true));
+
+    await expect(
+      harness.dispatch({
+        type: "CANCEL_CAPTURE",
+        tabId: 42,
+        requestId: "cancel-before-save",
+      }),
+    ).resolves.toEqual({ ok: true, data: null });
+    releaseFinalLoad();
+
+    await expect(pending).resolves.toMatchObject({
+      ok: false,
+      code: "CAPTURE_CANCELLED",
+    });
+    expect(harness.storageSet).not.toHaveBeenCalled();
+    expect(harness.storage.has(sessionStorageKey(42))).toBe(false);
+    expect(harness.runtimeSendMessage).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "SESSION_UPDATED",
+        session: expect.objectContaining({ tabId: 42 }),
+      }),
+    );
+  });
+
+  it("keeps a removed-tab generation tombstone through an in-flight session write", async () => {
+    const harness = await createHarness({
+      url: "https://tieba.baidu.com/p/123",
+    });
+    harness.executeScript.mockResolvedValue([{ frameId: 0 }]);
+    harness.tabsSendMessage.mockImplementation(
+      async (_tabId: number, message: ContentRequest) =>
+        successfulApiContentResponse(message),
+    );
+
+    let releaseSessionWrite!: () => void;
+    let sessionWriteStarted = false;
+    const sessionWriteGate = new Promise<void>((resolve) => {
+      releaseSessionWrite = resolve;
+    });
+    harness.storageSet.mockImplementationOnce(
+      async (values: Record<string, unknown>) => {
+        sessionWriteStarted = true;
+        await sessionWriteGate;
+        for (const [key, value] of Object.entries(values)) {
+          harness.storage.set(key, value);
+        }
+      },
+    );
+
+    const pending = harness.dispatch({
+      type: "CAPTURE_WHOLE_THREAD",
+      tabId: 42,
+      requestId: "removed-during-save",
+    });
+    await vi.waitFor(() => expect(sessionWriteStarted).toBe(true));
+
+    harness.removed(42);
+    releaseSessionWrite();
+
+    await expect(pending).resolves.toMatchObject({
+      ok: false,
+      code: "CAPTURE_CANCELLED",
+    });
+    await vi.waitFor(() =>
+      expect(harness.storage.has(sessionStorageKey(42))).toBe(false),
+    );
+    expect(harness.runtimeSendMessage).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "SESSION_UPDATED",
+        session: expect.objectContaining({ tabId: 42 }),
+      }),
+    );
+    harness.tabsGet.mockRejectedValue(new Error("tab not found"));
+    await expect(
+      harness.dispatch({ type: "GET_TAB_REVIEW_CONTEXT", tabId: 42 }),
+    ).resolves.toEqual({
+      ok: true,
+      data: {
+        tabId: 42,
+        url: null,
+        threadId: null,
+        session: null,
+        captureProgress: null,
+      },
+    });
   });
 });
 
@@ -1378,7 +1889,6 @@ describe("evidence jump routing", () => {
     expect(harness.tabsSendMessage).toHaveBeenCalledWith(42, {
       type: "JUMP_TO_REPLY",
       expectedThreadId: "123",
-      waitForOfficialRoute: false,
       locator: expect.objectContaining({
         replyId: "reply-1",
         siteReplyId: "reply-1",
@@ -1389,7 +1899,6 @@ describe("evidence jump routing", () => {
     });
     expect(harness.tabsUpdate).not.toHaveBeenCalled();
     expect(harness.tabsReload).not.toHaveBeenCalled();
-    expect(harness.storage.has("kr_tieba_pending_jump_42")).toBe(false);
   });
 
   it("adds the SPA root-card fallback for an API-captured first floor", async () => {
@@ -1414,7 +1923,6 @@ describe("evidence jump routing", () => {
     expect(harness.tabsSendMessage).toHaveBeenCalledWith(42, {
       type: "JUMP_TO_REPLY",
       expectedThreadId: "123",
-      waitForOfficialRoute: false,
       locator: expect.objectContaining({
         replyId: "100",
         anchor: expect.stringContaining(".image-text"),
@@ -1422,7 +1930,7 @@ describe("evidence jump routing", () => {
     });
   });
 
-  it("navigates an unloaded official main reply and persists only its minimal pending locator", async () => {
+  it("keeps an unloaded official main reply on the current page", async () => {
     const harness = await createHarness({
       url: "https://tieba.baidu.com/p/123",
     });
@@ -1442,22 +1950,16 @@ describe("evidence jump routing", () => {
       replyId: "101",
     });
 
-    expect(response).toEqual({ ok: true, data: true });
-    expect(harness.tabsUpdate).toHaveBeenCalledWith(42, {
-      url: "https://tieba.baidu.com/p/123?pid=101#101",
+    expect(response).toEqual({
+      ok: false,
+      error: "尚未加载",
+      code: "EVIDENCE_NOT_LOADED",
     });
-    const pending = harness.storage.get("kr_tieba_pending_jump_42");
-    expect(pending).toMatchObject({
-      threadId: "123",
-      locator: { replyId: "101", siteReplyId: "101" },
-    });
-    expect(JSON.stringify(pending)).not.toContain("第 1 页内容");
-    expect(JSON.stringify(pending)).not.toContain("用户1");
-    expect(JSON.stringify(pending)).not.toContain("waitForOfficialRoute");
-    expect(JSON.stringify(pending)).not.toContain("expectedThreadId");
+    expect(harness.tabsUpdate).not.toHaveBeenCalled();
+    expect(harness.tabsReload).not.toHaveBeenCalled();
   });
 
-  it("reloads the same official PID so an in-memory sort change cannot make the jump a no-op", async () => {
+  it("never reloads when an unloaded reply shares the current official PID", async () => {
     const harness = await createHarness({
       url: "https://tieba.baidu.com/p/123?pid=101",
     });
@@ -1477,21 +1979,20 @@ describe("evidence jump routing", () => {
       replyId: "101",
     });
 
-    expect(response).toEqual({ ok: true, data: true });
+    expect(response).toEqual({
+      ok: false,
+      error: "倒序列表尚未挂载八楼",
+      code: "EVIDENCE_NOT_LOADED",
+    });
     expect(harness.tabsSendMessage).toHaveBeenCalledWith(
       42,
       expect.objectContaining({
         type: "JUMP_TO_REPLY",
         expectedThreadId: "123",
-        waitForOfficialRoute: false,
       }),
     );
-    expect(harness.tabsReload).toHaveBeenCalledWith(42);
+    expect(harness.tabsReload).not.toHaveBeenCalled();
     expect(harness.tabsUpdate).not.toHaveBeenCalled();
-    expect(harness.storage.get("kr_tieba_pending_jump_42")).toMatchObject({
-      threadId: "123",
-      locator: { replyId: "101", siteReplyId: "101" },
-    });
   });
 
   it.each([
@@ -1528,10 +2029,9 @@ describe("evidence jump routing", () => {
     });
     expect(harness.tabsUpdate).not.toHaveBeenCalled();
     expect(harness.tabsReload).not.toHaveBeenCalled();
-    expect(harness.storage.has("kr_tieba_pending_jump_42")).toBe(false);
   });
 
-  it("lets only the newest concurrent jump navigate", async () => {
+  it("lets only the newest concurrent in-page jump finish", async () => {
     const harness = await createHarness({
       url: "https://tieba.baidu.com/p/123",
     });
@@ -1577,176 +2077,17 @@ describe("evidence jump routing", () => {
       code: "EVIDENCE_NOT_LOADED",
     });
 
-    expect(second).toEqual({ ok: true, data: true });
+    expect(second).toEqual({
+      ok: false,
+      error: "当前列表未挂载目标",
+      code: "EVIDENCE_NOT_LOADED",
+    });
     await expect(first).resolves.toMatchObject({
       ok: false,
       code: "SESSION_STALE",
     });
-    expect(harness.tabsUpdate).toHaveBeenCalledTimes(1);
-    expect(harness.tabsUpdate).toHaveBeenCalledWith(42, {
-      url: "https://tieba.baidu.com/p/123?pid=102#102",
-    });
-    expect(harness.tabsReload).not.toHaveBeenCalled();
-  });
-
-  it("cancels a stale jump paused in pending storage without overwriting the newer pending locator", async () => {
-    const harness = await createHarness({
-      url: "https://tieba.baidu.com/p/123",
-    });
-    harness.storage.set(
-      sessionStorageKey(42),
-      mergeCapture(null, spaCapture(["101", "102"]), 42),
-    );
-    harness.executeScript.mockResolvedValue([{ frameId: 0 }]);
-    harness.tabsSendMessage.mockResolvedValue({
-      ok: false,
-      error: "当前列表未挂载目标",
-      code: "EVIDENCE_NOT_LOADED",
-    });
-
-    let releaseOldPendingWrite!: () => void;
-    const oldPendingWriteGate = new Promise<void>((resolve) => {
-      releaseOldPendingWrite = resolve;
-    });
-    harness.storageSet.mockImplementationOnce(
-      async (values: Record<string, unknown>) => {
-        await oldPendingWriteGate;
-        for (const [key, value] of Object.entries(values)) {
-          harness.storage.set(key, value);
-        }
-      },
-    );
-
-    const first = harness.dispatch({
-      type: "JUMP_TO_REPLY",
-      replyId: "101",
-    });
-    await vi.waitFor(() => expect(harness.storageSet).toHaveBeenCalledTimes(1));
-
-    const second = harness.dispatch({
-      type: "JUMP_TO_REPLY",
-      replyId: "102",
-    });
-    await vi.waitFor(() =>
-      expect(harness.tabsSendMessage).toHaveBeenCalledTimes(2),
-    );
     expect(harness.tabsUpdate).not.toHaveBeenCalled();
     expect(harness.tabsReload).not.toHaveBeenCalled();
-
-    releaseOldPendingWrite();
-
-    await expect(first).resolves.toMatchObject({
-      ok: false,
-      code: "SESSION_STALE",
-    });
-    await expect(second).resolves.toEqual({ ok: true, data: true });
-    expect(harness.tabsUpdate).toHaveBeenCalledTimes(1);
-    expect(harness.tabsUpdate).toHaveBeenCalledWith(42, {
-      url: "https://tieba.baidu.com/p/123?pid=102#102",
-    });
-    expect(harness.tabsReload).not.toHaveBeenCalled();
-    expect(harness.storage.get("kr_tieba_pending_jump_42")).toMatchObject({
-      threadId: "123",
-      locator: { replyId: "102", siteReplyId: "102" },
-    });
-  });
-
-  it("does not return to the old thread when loading suspends a jump paused in pending storage", async () => {
-    const harness = await createHarness({
-      url: "https://tieba.baidu.com/p/123",
-    });
-    harness.storage.set(
-      sessionStorageKey(42),
-      mergeCapture(null, spaCapture(["101"]), 42),
-    );
-    harness.executeScript.mockResolvedValue([{ frameId: 0 }]);
-    harness.tabsSendMessage.mockResolvedValue({
-      ok: false,
-      error: "当前列表未挂载目标",
-      code: "EVIDENCE_NOT_LOADED",
-    });
-    let releasePendingWrite!: () => void;
-    const pendingWriteGate = new Promise<void>((resolve) => {
-      releasePendingWrite = resolve;
-    });
-    harness.storageSet.mockImplementationOnce(
-      async (values: Record<string, unknown>) => {
-        await pendingWriteGate;
-        for (const [key, value] of Object.entries(values)) {
-          harness.storage.set(key, value);
-        }
-      },
-    );
-
-    const jump = harness.dispatch({
-      type: "JUMP_TO_REPLY",
-      replyId: "101",
-    });
-    await vi.waitFor(() => expect(harness.storageSet).toHaveBeenCalledTimes(1));
-    harness.updated(harness.activeTab, "loading");
-    releasePendingWrite();
-
-    await expect(jump).resolves.toMatchObject({
-      ok: false,
-      code: "SESSION_STALE",
-    });
-    expect(harness.tabsUpdate).not.toHaveBeenCalled();
-    expect(harness.tabsReload).not.toHaveBeenCalled();
-    expect(harness.storage.has("kr_tieba_pending_jump_42")).toBe(false);
-  });
-
-  it("does not return to the old thread when navigation clears a jump paused in pending storage", async () => {
-    const harness = await createHarness({
-      url: "https://tieba.baidu.com/p/123",
-    });
-    harness.storage.set(
-      sessionStorageKey(42),
-      mergeCapture(null, spaCapture(["101"]), 42),
-    );
-    harness.executeScript.mockResolvedValue([{ frameId: 0 }]);
-    harness.tabsSendMessage.mockResolvedValue({
-      ok: false,
-      error: "当前列表未挂载目标",
-      code: "EVIDENCE_NOT_LOADED",
-    });
-    let releasePendingWrite!: () => void;
-    const pendingWriteGate = new Promise<void>((resolve) => {
-      releasePendingWrite = resolve;
-    });
-    harness.storageSet.mockImplementationOnce(
-      async (values: Record<string, unknown>) => {
-        await pendingWriteGate;
-        for (const [key, value] of Object.entries(values)) {
-          harness.storage.set(key, value);
-        }
-      },
-    );
-
-    const jump = harness.dispatch({
-      type: "JUMP_TO_REPLY",
-      replyId: "101",
-    });
-    await vi.waitFor(() => expect(harness.storageSet).toHaveBeenCalledTimes(1));
-    harness.updated(
-      harness.activeTab,
-      null,
-      "https://tieba.baidu.com/p/999",
-    );
-    await vi.waitFor(() =>
-      expect(harness.storageRemove).toHaveBeenCalledWith(
-        "kr_tieba_pending_jump_42",
-      ),
-    );
-    releasePendingWrite();
-
-    await expect(jump).resolves.toMatchObject({
-      ok: false,
-      code: "SESSION_STALE",
-    });
-    expect(harness.tabsUpdate).not.toHaveBeenCalled();
-    expect(harness.tabsReload).not.toHaveBeenCalled();
-    expect(harness.storage.has("kr_tieba_pending_jump_42")).toBe(false);
-    expect(harness.storage.has(sessionStorageKey(42))).toBe(false);
   });
 
   it("does not navigate when the active tab changes while in-page lookup is running", async () => {
@@ -1785,10 +2126,9 @@ describe("evidence jump routing", () => {
     });
     expect(harness.tabsUpdate).not.toHaveBeenCalled();
     expect(harness.tabsReload).not.toHaveBeenCalled();
-    expect(harness.storage.has("kr_tieba_pending_jump_42")).toBe(false);
   });
 
-  it("uses the parent PID and child CID for an unloaded API nested reply", async () => {
+  it("keeps an unloaded API nested reply on the current page", async () => {
     const harness = await createHarness({
       url: "https://tieba.baidu.com/p/123",
     });
@@ -1818,23 +2158,13 @@ describe("evidence jump routing", () => {
       replyId: "201",
     });
 
-    expect(response).toEqual({ ok: true, data: true });
-    expect(harness.tabsUpdate).toHaveBeenCalledWith(42, {
-      url: "https://tieba.baidu.com/p/123?pid=101&cid=201#201",
+    expect(response).toEqual({
+      ok: false,
+      error: "楼中楼尚未挂载",
+      code: "EVIDENCE_NOT_LOADED",
     });
-    const pending = harness.storage.get("kr_tieba_pending_jump_42");
-    expect(pending).toMatchObject({
-      threadId: "123",
-      locator: {
-        replyId: "201",
-        siteReplyId: "201",
-        parentReplyId: "101",
-        parentSiteReplyId: "101",
-        isNested: true,
-      },
-    });
-    expect(JSON.stringify(pending)).not.toContain("楼中楼证据正文");
-    expect(JSON.stringify(pending)).not.toContain("楼中楼用户");
+    expect(harness.tabsUpdate).not.toHaveBeenCalled();
+    expect(harness.tabsReload).not.toHaveBeenCalled();
   });
 
   it("never navigates or expands an unloaded nested reply", async () => {
@@ -1871,70 +2201,4 @@ describe("evidence jump routing", () => {
     expect(harness.tabsUpdate).not.toHaveBeenCalled();
   });
 
-  it("keeps a pending official jump when the target is still not mounted, then clears it after a retry succeeds", async () => {
-    const harness = await createHarness({
-      url: "https://tieba.baidu.com/p/123",
-    });
-    harness.storage.set(
-      sessionStorageKey(42),
-      mergeCapture(null, spaCapture(["101"], "document-1"), 42),
-    );
-    harness.executeScript.mockResolvedValue([{ frameId: 0 }]);
-    harness.tabsSendMessage.mockResolvedValue({
-      ok: false,
-      error: "尚未挂载",
-      code: "EVIDENCE_NOT_LOADED",
-    });
-    await harness.dispatch({ type: "JUMP_TO_REPLY", replyId: "101" });
-    expect(harness.storage.has("kr_tieba_pending_jump_42")).toBe(true);
-    harness.tabsSendMessage.mockClear();
-
-    harness.updated(harness.activeTab, "loading");
-    harness.tabsSendMessage.mockImplementation(
-      async (_tabId: number, message: { type: string }) => {
-        if (message.type === "PARSE_TIEBA_PAGE") {
-          return { ok: true, data: spaCapture(["101"], "document-2") };
-        }
-        if (message.type === "START_DYNAMIC_CAPTURE") {
-          return { ok: true, data: true };
-        }
-        return {
-          ok: false,
-          error: "尚未挂载",
-          code: "EVIDENCE_NOT_LOADED",
-        };
-      },
-    );
-    harness.updated(harness.activeTab, "complete");
-    await vi.waitFor(() =>
-      expect(
-        harness.tabsSendMessage.mock.calls.some(
-          ([, message]) => (message as { type: string }).type === "JUMP_TO_REPLY",
-        ),
-      ).toBe(true),
-    );
-    const pendingResume = harness.tabsSendMessage.mock.calls.find(
-      ([, message]) => (message as { type: string }).type === "JUMP_TO_REPLY",
-    )?.[1] as ContentRequest | undefined;
-    expect(pendingResume).toMatchObject({
-      type: "JUMP_TO_REPLY",
-      expectedThreadId: "123",
-      waitForOfficialRoute: true,
-    });
-    expect(harness.storage.has("kr_tieba_pending_jump_42")).toBe(true);
-
-    harness.tabsSendMessage.mockResolvedValue({ ok: true, data: true });
-    expect(
-      await harness.dispatch({ type: "JUMP_TO_REPLY", replyId: "101" }),
-    ).toEqual({ ok: true, data: true });
-    expect(harness.tabsSendMessage).toHaveBeenLastCalledWith(
-      42,
-      expect.objectContaining({
-        type: "JUMP_TO_REPLY",
-        expectedThreadId: "123",
-        waitForOfficialRoute: true,
-      }),
-    );
-    expect(harness.storage.has("kr_tieba_pending_jump_42")).toBe(false);
-  });
 });

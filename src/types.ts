@@ -146,6 +146,12 @@ export interface ReviewRecord {
   primaryReasonId: string | null;
   internalTags: string[];
   reviewedAt: string;
+  /** Links a human decision to the exact persisted AI attempt when known. */
+  analysisAttemptId?: string | null;
+  /** Hash-only immutable snapshot identity; never contains thread text. */
+  snapshotId?: string | null;
+  /** Stable finding id inside the linked AI result. */
+  findingId?: string | null;
   analyzerVersions: {
     local: string;
     cloud: string | null;

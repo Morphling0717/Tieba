@@ -55,15 +55,11 @@ describe("DeepSeek OpenAI-compatible request", () => {
                 content: JSON.stringify({
                   summary: "未发现达到门槛的违规线索。",
                   findings: [],
-                  uncertainties: [],
                   report: {
-                    discussionOverview: "测试讨论。",
-                    discussionMap: [],
-                    participantDynamics: [],
-                    borderlineCases: [],
-                    normalHeatedDiscussion: [],
-                    coverageNotes: [],
-                    reviewPriorities: [],
+                    overview: "测试讨论。",
+                    stages: [],
+                    interactions: [],
+                    notes: [],
                   },
                 }),
                 reasoning_content: "不得回传的隐藏推理",
@@ -71,6 +67,11 @@ describe("DeepSeek OpenAI-compatible request", () => {
               finish_reason: "stop",
             },
           ],
+          usage: {
+            prompt_tokens: 1_280,
+            completion_tokens: 220,
+            total_tokens: 1_500,
+          },
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       ),
@@ -92,7 +93,7 @@ describe("DeepSeek OpenAI-compatible request", () => {
       model: "deepseek-v4-pro",
       thinking: { type: "enabled" },
       reasoning_effort: "max",
-      max_tokens: 32_768,
+      max_tokens: 384_000,
       stream: false,
       response_format: { type: "json_object" },
     });
@@ -101,9 +102,61 @@ describe("DeepSeek OpenAI-compatible request", () => {
     const messageText = messages.map((message) => message.content).join("\n");
     expect(messageText).toContain("json");
     expect(messageText).toContain('"findings"');
+    expect(messageText).toContain('"interactions"');
+    expect(messageText).toContain("自由文案不得出现 P/U/R 编号");
+    expect(messageText).not.toContain('"usage"');
     expect(messageText).not.toContain("reasoning_content");
     expect(result.summary).toBe("未发现达到门槛的违规线索。");
+    expect(result.protocolVersion).toBe(3);
+    expect(result.usage).toEqual({
+      inputTokens: 1_280,
+      outputTokens: 220,
+      totalTokens: 1_500,
+    });
     expect(JSON.stringify(result)).not.toContain("隐藏推理");
+  });
+
+  it("ignores malformed optional provider usage without rejecting the analysis", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  summary: "未发现达到门槛的线索。",
+                  findings: [],
+                  report: {
+                    overview: "普通测试讨论。",
+                    stages: [],
+                    interactions: [],
+                    notes: [],
+                  },
+                }),
+              },
+            },
+          ],
+          usage: {
+            prompt_tokens: -1,
+            completion_tokens: 20,
+            total_tokens: 19,
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await analyzeWholeThreadWithCloud("测试帖", [reply], {
+      endpoint: "https://api.deepseek.com/chat/completions",
+      model: "deepseek-v4-pro",
+      apiKey: "session-only-key",
+      mode: "deep",
+    });
+
+    expect(result.protocolVersion).toBe(3);
+    expect(result.usage).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("uses the exact completion URL and disables thinking in fast mode", async () => {

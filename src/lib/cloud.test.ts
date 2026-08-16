@@ -151,14 +151,20 @@ describe("cloud analysis protocol", () => {
       ),
     );
     vi.stubGlobal("fetch", fetchMock);
+    const beforeSend = vi.fn();
 
     const result = await deepAnalyzeFinding(finding(), replies, {
       endpoint: "https://provider.test/v1",
       model: "example-model",
       apiKey: "session-only-key",
+      beforeSend,
     });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(beforeSend).toHaveBeenCalledTimes(1);
+    expect(beforeSend.mock.invocationCallOrder[0]).toBeLessThan(
+      fetchMock.mock.invocationCallOrder[0]!,
+    );
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       "https://provider.test/v1/chat/completions",
     );
@@ -536,7 +542,7 @@ describe("whole-thread cloud analysis protocol", () => {
     expect(requestBody).toMatchObject({
       enable_thinking: false,
       stream: false,
-      max_completion_tokens: 32_768,
+      max_completion_tokens: 16_384,
       response_format: { type: "json_object" },
     });
     expect(requestBody).not.toHaveProperty("max_tokens");
@@ -549,60 +555,63 @@ describe("whole-thread cloud analysis protocol", () => {
     };
     const systemMessage = requestBody.messages[0]!.content;
     expect(systemMessage).toContain(
-      "findings 只允许收录你结合完整上下文后认为很可能违规（confidence 至少 0.70）",
+      "findings 只允许收录你结合完整上下文后认为很可能需要处置（confidence 至少 0.70）",
     );
     expect(systemMessage).toContain(
-      "最终认为不违规但值得人工留意的内容，只能写入顶层 uncertainties",
+      "低置信、对象或语气不明、边界案例写入 report.notes",
     );
     expect(systemMessage).toContain(
       "对虚构角色、角色行为、剧情、设定、战术或计策的激烈负面评价",
     );
     expect(systemMessage).toContain(
-      "有实质分析时不得使用 R12.01",
+      "有实质分析时不得选择该理由",
+    );
+    expect(systemMessage).toContain(
+      "具体回复只通过同级 replyIds 表达",
+    );
+    expect(systemMessage).toContain(
+      "规则编号只允许出现在 primaryReasonId",
     );
     expect(systemMessage).toContain(
       "演员、导演、编剧、制作人员、创作者、现实粉丝或用户均属于现实人物或现实群体",
     );
     expect(systemMessage).toContain(
-      "summary 对违规数量和是否存在违规的表述必须与 findings 完全一致",
+      "待复核线索数量必须与 findings 完全一致",
     );
     expect(systemMessage).toContain(
-      "如果谈及任何具体回复，必须在该句中写出 payload 中真实存在的 P 标识",
+      "所有自由文案，包括顶层 summary",
     );
     expect(systemMessage).toContain(
-      "不得直接写“8楼”、“第 46 楼”之类猜测的楼层数",
+      "不得自行写楼层数字或用户名",
     );
     expect(systemMessage).toContain(
       "不得输出、复述或描述隐藏思维链、内部逐步推理、草稿和未公开推理过程",
     );
     expect(systemMessage).toContain(
-      "所有顶层键 summary、findings、uncertainties、report 以及 report 的七个子键每次都必须出现",
+      "顶层只能使用 summary、findings、report",
     );
     expect(systemMessage).toContain(
-      "必须都是 JSON 字符串数组（string[]）",
+      "stages 最多8项",
     );
     expect(systemMessage).toContain(
-      "不得写成对象、键值表或嵌套数组",
+      "needs_human_check 最多5项、heated_but_allowed 最多3项",
     );
     for (const key of [
-      "discussionOverview",
-      "discussionMap",
-      "participantDynamics",
-      "borderlineCases",
-      "normalHeatedDiscussion",
-      "coverageNotes",
-      "reviewPriorities",
+      "overview",
+      "stages",
+      "interactions",
+      "notes",
     ]) {
       expect(systemMessage).toContain(`"${key}"`);
     }
     expect(userMessage.task).toContain(
-      "未达到或最终认为不违规的候选只写入顶层 uncertainties",
+      "未达到或正常激烈内容只放 report.notes",
     );
     expect(userMessage.task).toContain(
-      "先判断每个候选的对象是虚构角色/剧情/计策还是现实人物/用户",
+      "先判断对象是虚构角色/剧情/计策还是现实人物/用户",
     );
     expect(userMessage.task).toContain(
-      "违规组数和结论必须严格等于 findings 的实际内容",
+      "顶层 summary 数量必须等于 findings",
     );
     expect(userMessage.payload.replies).toHaveLength(268);
     expect(userMessage.payload.rules).toHaveLength(112);
@@ -720,6 +729,9 @@ describe("whole-thread cloud analysis protocol", () => {
         apiKey: "session-only-key",
       },
     );
+    if (result.protocolVersion === 3) {
+      throw new Error("legacy provider fixture unexpectedly parsed as v3");
+    }
 
     expect(result.findings).toHaveLength(1);
     expect(result.findings[0]?.replyIds).toEqual(["nested-1"]);
@@ -1169,6 +1181,9 @@ describe("whole-thread cloud analysis protocol", () => {
         apiKey: "session-only-key",
       },
     );
+    if (result.protocolVersion === 3) {
+      throw new Error("legacy provider fixture unexpectedly parsed as v3");
+    }
 
     expect(result.uncertainties[0]).toHaveLength(500);
     expect(result.uncertainties[0]).toMatch(/…$/u);
@@ -1264,6 +1279,7 @@ describe("whole-thread cloud analysis protocol", () => {
 
   it("does not truncate or call the provider when the whole thread exceeds the safe budget", async () => {
     const fetchMock = vi.fn();
+    const beforeSend = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
     const oversizedReply = reply(
       "oversized-main",
@@ -1278,9 +1294,11 @@ describe("whole-thread cloud analysis protocol", () => {
           "https://workspace.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
         model: "qwen3.7-max",
         apiKey: "session-only-key",
+        beforeSend,
       }),
     ).rejects.toMatchObject({ code: "payload_too_large" });
     expect(fetchMock).not.toHaveBeenCalled();
+    expect(beforeSend).not.toHaveBeenCalled();
   });
 
   it("exports only locally verified cross-reply relationships", () => {

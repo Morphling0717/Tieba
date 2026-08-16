@@ -1,13 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CapturedReply } from "../types";
-import { analyzeWholeThreadWithCloud } from "./cloud";
+import {
+  analyzeWholeThreadWithCloud,
+  type WholeThreadCloudAnalysisResultV3,
+} from "./cloud";
 
 function reply(index: number): CapturedReply {
   return {
     id: `reply-${index}`,
     siteReplyId: `site-${index}`,
     floor: index,
-    parentReplyId: null,
+    parentReplyId: index === 2 ? "reply-1" : null,
     authorName: `测试用户${index}`,
     time: "2026-08-15 10:00",
     timestamp: Date.parse("2026-08-15T10:00:00+08:00") + index,
@@ -16,26 +19,41 @@ function reply(index: number): CapturedReply {
     sourceUrl: "https://tieba.baidu.com/p/123",
     anchor: `#post-${index}`,
     imageCount: 0,
-    isNested: false,
+    isNested: index === 2,
     unexpandedNestedCount: 0,
   };
 }
 
 const replies = Array.from({ length: 10 }, (_, index) => reply(index + 1));
 
-function validFinding(uncertainties: unknown[] = []): Record<string, unknown> {
+function validFinding(overrides: Record<string, unknown> = {}) {
   return {
     type: "personal_attack",
     severity: "high",
     score: 90,
-    summary: "P1 对 U10 作出直接贬损",
+    summary: "一名现实用户直接贬损另一名用户",
     offendingReplyIds: ["P1"],
-    contextReplyIds: ["P10"],
-    evidence: [{ replyId: "P1", explanation: "P1 指向 U10" }],
+    contextReplyIds: [],
+    evidence: [{ replyId: "P1", explanation: "措辞直接指向现实用户" }],
     primaryReasonId: "R03.01",
     confidence: 0.91,
-    rationale: "结合 P1 与 P10 可以定位",
-    uncertainties,
+    rationale: "对象与措辞均明确，建议结合原文确认",
+    uncertainties: [],
+    ...overrides,
+  };
+}
+
+function validV3Result(overrides: Record<string, unknown> = {}) {
+  return {
+    summary: "发现1组需要人工复核的高置信线索。",
+    findings: [validFinding()],
+    report: {
+      overview: "讨论由作品观点交换转为现实用户冲突。",
+      stages: [],
+      interactions: [],
+      notes: [],
+    },
+    ...overrides,
   };
 }
 
@@ -48,29 +66,72 @@ function responseFor(providerResult: unknown): Response {
   );
 }
 
-afterEach(() => {
-  vi.unstubAllGlobals();
-});
+function assertV3(
+  result: Awaited<ReturnType<typeof analyzeWholeThreadWithCloud>>,
+): asserts result is WholeThreadCloudAnalysisResultV3 {
+  expect(result.protocolVersion).toBe(3);
+  if (result.protocolVersion !== 3) throw new Error("expected protocol v3");
+}
 
-describe("whole-thread narrative normalization fuzz", () => {
-  it("localizes token variants without matching P/U inside ASCII or fullwidth words", async () => {
-    const providerResult = {
+function allV3Prose(result: WholeThreadCloudAnalysisResultV3): string {
+  return [
+    result.summary,
+    result.report.overview,
+    ...result.report.stages.flatMap((item) => [item.title, item.summary]),
+    ...result.report.interactions.flatMap((item) => [item.title, item.summary]),
+    ...result.report.notes.flatMap((item) => [item.title, item.summary]),
+    ...result.findings.flatMap((item) => [
+      item.summary,
+      ...item.uncertainties,
+      ...item.evidence.flatMap((evidence) => evidence.signals),
+      ...item.reasonCandidates.map((reason) => reason.rationale),
+    ]),
+  ].join("\n");
+}
+
+afterEach(() => vi.unstubAllGlobals());
+
+describe("whole-thread v3 narrative normalization fuzz", () => {
+  it("keeps references structural, maps only exact allowlisted reply IDs, and removes protocol tokens from prose", async () => {
+    const providerResult = validV3Result({
       summary:
-        "查看 p1、u10、P 1、U\t10、Ｐ１、Ｕ１０、P999、U999；保留 CPU31 与 ＣＰＵ３１。",
-      findings: [validFinding()],
-      uncertainties: [
-        "p1/u10/P 1/U 10/Ｐ１/Ｕ１０/P999/U999；CPU31；ＣＰＵ３１；foo_P1；ｆｏｏ＿Ｐ１",
+        "查看 p1、u10、P 1、U\t10、Ｐ１、Ｕ１０、R03.01、Ｒ０３．０１；保留 CPU31 与 foo_P1。",
+      findings: [
+        validFinding({
+          summary: "P1 对 U10 作出贬损，可能涉及 R03.01",
+          rationale: "结合 P1 与 P10，并按 R03.01 复核",
+          evidence: [
+            { replyId: "P1", explanation: "P1 的作者指向 U10" },
+          ],
+          uncertainties: ["P10 的语气仍需人工判断"],
+        }),
       ],
       report: {
-        discussionOverview: "p1 与 Ｕ１０ 的互动；另有 CPU31 和 ＣＰＵ３１",
-        discussionMap: ["P 1 -> u10，未知 P999/U999"],
-        participantDynamics: [],
-        borderlineCases: [],
-        normalHeatedDiscussion: [],
-        coverageNotes: [],
-        reviewPriorities: [],
+        overview: "P1 与 U10 的互动；另有 CPU31 和 foo_P1",
+        stages: [
+          {
+            title: "P1 开始讨论",
+            summary: "涉及 P1、P999 与 R03.01",
+            replyIds: ["P1", "P999", " P2 ", "p2"],
+          },
+        ],
+        interactions: [
+          {
+            title: "用户互动",
+            summary: "U1 回应 U2",
+            replyIds: ["P1", "P2", "P1"],
+          },
+        ],
+        notes: [
+          {
+            kind: "needs_human_check",
+            title: "P999 无法定位",
+            summary: "P1 仍需结合 P999 检查",
+            replyIds: ["P1", "P999"],
+          },
+        ],
       },
-    };
+    });
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(responseFor(providerResult)));
 
     const result = await analyzeWholeThreadWithCloud("引用变体", replies, {
@@ -78,86 +139,185 @@ describe("whole-thread narrative normalization fuzz", () => {
       model: "test-model",
       apiKey: "session-only-key",
     });
-    const serialized = JSON.stringify(result);
+    assertV3(result);
 
-    expect(result.findings).toHaveLength(1);
-    expect(serialized).toContain("第 1 楼");
-    expect(serialized).toContain("测试用户10");
-    expect(serialized).toContain("无法定位的回复");
-    expect(serialized).toContain("无法定位的用户");
-    expect(serialized).toContain("CPU31");
-    expect(serialized).toContain("ＣＰＵ３１");
-    expect(serialized).toContain("foo_P1");
-    expect(serialized).toContain("ｆｏｏ＿Ｐ１");
-    expect(serialized).not.toMatch(
+    expect(result.report.stages[0]?.replyIds).toEqual(["reply-1"]);
+    expect(result.report.interactions[0]?.replyIds).toEqual([
+      "reply-1",
+      "reply-2",
+    ]);
+    expect(result.report.notes[0]?.replyIds).toEqual(["reply-1"]);
+    expect(result.uncertainties).toEqual([
+      expect.stringContaining("相关回复"),
+    ]);
+    const prose = allV3Prose(result);
+    expect(prose).toContain("CPU31");
+    expect(prose).toContain("foo_P1");
+    expect(prose).not.toMatch(
       /(?<![A-Za-z0-9_Ａ-Ｚａ-ｚ０-９＿])[PpUuＰｐＵｕ][\t\p{Zs}]*[0-9０-９]+(?![A-Za-z0-9_Ａ-Ｚａ-ｚ０-９＿])/u,
     );
+    expect(prose).not.toMatch(
+      /(?<![A-Za-z0-9_Ａ-Ｚａ-ｚ０-９＿])[RrＲｒ][\t\p{Zs}]*[0-9０-９]+[\t\p{Zs}]*[.．][\t\p{Zs}]*[0-9０-９]+/u,
+    );
+    expect(result.findings[0]?.reasonCandidates[0]?.reasonId).toBe("R03.01");
   });
 
-  it("survives deterministic mixed narrative shapes without echoing unknown fields or creating findings", async () => {
+  it("bounds every v3 prose/list field and drops malformed narrative objects without echoing unknown fields", async () => {
+    const secret = "DO_NOT_ECHO_PROVIDER_SECRET";
+    const stages: unknown[] = Array.from({ length: 14 }, (_, index) => ({
+      title: `阶段${index}${"题".repeat(40)}`,
+      summary: `${"段".repeat(190)} P1`,
+      replyIds: [index % 2 === 0 ? "P1" : "P999"],
+      unknownProviderField: secret,
+    }));
+    stages.splice(2, 0, { title: "缺少摘要" }, null);
+    const interactions = Array.from({ length: 9 }, (_, index) => ({
+      title: `互动${index}`,
+      summary: "关键互动",
+      replyIds: ["P2"],
+    }));
+    const notes = [
+      ...Array.from({ length: 8 }, (_, index) => ({
+        kind: "needs_human_check",
+        title: `待确认${index}`,
+        summary: "需要人工确认",
+        replyIds: ["P1"],
+      })),
+      ...Array.from({ length: 6 }, (_, index) => ({
+        kind: "heated_but_allowed",
+        title: `正常激烈${index}`,
+        summary: "有实质观点",
+        replyIds: ["P2"],
+      })),
+      { kind: "invented", title: secret, summary: secret, replyIds: ["P1"] },
+    ];
+    const providerResult = validV3Result({
+      summary: `${"总".repeat(220)} P1`,
+      findings: [
+        validFinding({
+          summary: `${"线".repeat(130)} P1`,
+          rationale: `${"理".repeat(210)} R03.01`,
+          evidence: [
+            { replyId: "P1", explanation: `${"证".repeat(190)} U1` },
+          ],
+          uncertainties: Array.from({ length: 7 }, () =>
+            `${"疑".repeat(180)} P1`,
+          ),
+        }),
+      ],
+      report: {
+        overview: `${"概".repeat(280)} P1`,
+        stages,
+        interactions,
+        notes,
+      },
+      unknownProviderField: secret,
+    });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(responseFor(providerResult)));
+
+    const result = await analyzeWholeThreadWithCloud("上限", replies, {
+      endpoint: "https://provider.test/v1",
+      model: "test-model",
+      apiKey: "session-only-key",
+    });
+    assertV3(result);
+
+    expect(result.summary).toHaveLength(180);
+    expect(result.report.overview).toHaveLength(240);
+    expect(result.report.stages).toHaveLength(8);
+    expect(result.report.interactions).toHaveLength(5);
+    expect(
+      result.report.notes.filter((item) => item.kind === "needs_human_check"),
+    ).toHaveLength(5);
+    expect(
+      result.report.notes.filter((item) => item.kind === "heated_but_allowed"),
+    ).toHaveLength(3);
+    expect(result.report.stages.every((item) => item.title.length <= 32)).toBe(
+      true,
+    );
+    expect(result.report.stages.every((item) => item.summary.length <= 160)).toBe(
+      true,
+    );
+    expect(result.findings[0]?.summary).toHaveLength(100);
+    expect(result.findings[0]?.reasonCandidates[0]?.rationale).toHaveLength(180);
+    expect(result.findings[0]?.evidence[0]?.signals[0]).toHaveLength(163);
+    expect(result.findings[0]?.uncertainties).toHaveLength(3);
+    expect(
+      result.findings[0]?.uncertainties.every((item) => item.length <= 160),
+    ).toBe(true);
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it("keeps the top summary to two sentences", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        responseFor(
+          validV3Result({
+            summary: "第一句。第二句！第三句不应进入结果。",
+            findings: [],
+          }),
+        ),
+      ),
+    );
+
+    const result = await analyzeWholeThreadWithCloud("句数", replies, {
+      endpoint: "https://provider.test/v1",
+      model: "test-model",
+      apiKey: "session-only-key",
+    });
+    assertV3(result);
+    expect(result.summary).toBe("第一句。第二句！");
+  });
+
+  it("survives deterministic mixed v3 report shapes without creating clickable unknown references", async () => {
     let state = 0x5eed1234;
     const next = (): number => {
       state = (Math.imul(state, 1_664_525) + 1_013_904_223) >>> 0;
       return state;
     };
 
-    for (let run = 0; run < 24; run += 1) {
-      const secret = `DO_NOT_ECHO_${run}_${next()}`;
-      const ignoredWhitespace = `IGNORED_SPACE_${run}`;
-      const ignoredLowercase = `IGNORED_LOWER_${run}`;
+    for (let run = 0; run < 20; run += 1) {
+      const secret = `SECRET_${run}_${next()}`;
       const variants: unknown[] = [
-        `复核 P1、P10、P999、U1、U10、U999（${run}）`,
         {
-          label: "阶段",
-          note: "P1 与 U10 的上下文",
-          replyIds: ["P1", "P10", "P999"],
-          unknownProviderField: secret,
-          offendingReplyIds: ["P10"],
-          primaryReasonId: "R99.99",
+          title: "有效阶段",
+          summary: "P1 的讨论",
+          replyIds: ["P1", "P999", " P2 ", "p2"],
+          secret,
         },
-        { note: "未知编号", replyId: "P999", secret },
-        { note: ignoredWhitespace, replyId: " P1 ", secret },
-        { note: ignoredLowercase, replyId: "p1", secret },
-        { note: "非字符串引用", replyIds: ["P1", 10], secret },
-        { note: "测".repeat(4_500), secret },
-        { unknownOnly: secret, primaryReasonId: "R99.99" },
+        { title: "缺少引用", summary: "忽略", secret },
+        { title: secret, summary: 42, replyIds: ["P1"] },
+        { title: "非字符串引用", summary: "忽略", replyIds: ["P1", 2] },
         null,
+        ["嵌套数组"],
         next(),
-        ["嵌套数组", { secret }],
       ];
       const mixed = Array.from(
-        { length: 18 },
+        { length: 16 },
         () => variants[next() % variants.length],
       );
-      // Ensure every run exercises both accepted provider prose and rejected
-      // action-shaped/unknown-only values, regardless of the PRNG picks.
-      mixed.push(variants[0], variants[1], variants[3], variants[4], variants[7]);
-
-      const providerResult = {
-        summary: "发现一项明确线索，P1 需结合 P10 复核",
-        findings: [validFinding(mixed)],
-        uncertainties: mixed,
-        report: {
-          discussionOverview: {
-            overview: "P1 与 U10 的讨论概览",
-            unknownProviderField: secret,
-            primaryReasonId: "R99.99",
-          },
-          discussionMap: mixed,
-          participantDynamics: mixed,
-          borderlineCases: mixed,
-          normalHeatedDiscussion: mixed,
-          coverageNotes: mixed,
-          reviewPriorities: mixed,
-        },
-      };
+      mixed.push(variants[0]);
       vi.stubGlobal(
         "fetch",
-        vi.fn().mockResolvedValue(responseFor(providerResult)),
+        vi.fn().mockResolvedValue(
+          responseFor(
+            validV3Result({
+              findings: [],
+              summary: "未发现达到门槛的线索。",
+              report: {
+                overview: "正常讨论。",
+                stages: mixed,
+                interactions: mixed,
+                notes: [],
+              },
+            }),
+          ),
+        ),
       );
 
       const result = await analyzeWholeThreadWithCloud(
-        `混合形状 ${run}`,
+        `混合形状${run}`,
         replies,
         {
           endpoint: "https://provider.test/v1",
@@ -165,130 +325,16 @@ describe("whole-thread narrative normalization fuzz", () => {
           apiKey: "session-only-key",
         },
       );
-      const serialized = JSON.stringify(result);
-
-      expect(result.findings, `run ${run}`).toHaveLength(1);
-      expect(result.findings[0]?.replyIds, `run ${run}`).toEqual(["reply-1"]);
-      expect(serialized, `run ${run}`).not.toContain(secret);
-      expect(serialized, `run ${run}`).not.toContain(ignoredWhitespace);
-      expect(serialized, `run ${run}`).not.toContain(ignoredLowercase);
-      expect(serialized, `run ${run}`).not.toContain("R99.99");
-      expect(serialized, `run ${run}`).not.toMatch(
-        /(?<![A-Za-z0-9_Ａ-Ｚａ-ｚ０-９＿])[PpUuＰｐＵｕ][\t\p{Zs}]*[0-9０-９]+(?![A-Za-z0-9_Ａ-Ｚａ-ｚ０-９＿])/u,
-      );
-    }
-  });
-
-  it("bounds oversized and non-array narrative containers with safe diagnostics", async () => {
-    const providerResult = {
-      summary: "未发现达到门槛的违规",
-      findings: [],
-      uncertainties: Array.from({ length: 80 }, (_, index) =>
-        index % 2 === 0 ? `第 ${index} 项提到 P1` : { note: `对象 ${index} 提到 U1` },
-      ),
-      report: {
-        discussionOverview: ["不是字符串或对象"],
-        discussionMap: 42,
-        participantDynamics: { note: "容器类型错误" },
-        borderlineCases: null,
-        normalHeatedDiscussion: "不是数组",
-        coverageNotes: undefined,
-        reviewPriorities: Array.from({ length: 130 }, (_, index) =>
-          `优先级 ${index}：P10`,
-        ),
-      },
-    };
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(responseFor(providerResult)));
-
-    const result = await analyzeWholeThreadWithCloud("边界", replies, {
-      endpoint: "https://provider.test/v1",
-      model: "test-model",
-      apiKey: "session-only-key",
-    });
-    const serialized = JSON.stringify(result);
-
-    expect(result.findings).toEqual([]);
-    expect(result.uncertainties).toHaveLength(50);
-    expect(result.uncertainties.at(-1)).toMatch(/^有\d+条格式异常说明已忽略。$/u);
-    expect(result.report?.discussionOverview).toBe("有1条格式异常说明已忽略。");
-    expect(result.report?.discussionMap).toEqual(["有1条格式异常说明已忽略。"]);
-    expect(result.report?.participantDynamics).toEqual(["有1条格式异常说明已忽略。"]);
-    expect(result.report?.borderlineCases).toEqual([]);
-    expect(result.report?.normalHeatedDiscussion).toEqual(["有1条格式异常说明已忽略。"]);
-    expect(result.report?.coverageNotes).toEqual([]);
-    expect(result.report?.reviewPriorities).toHaveLength(100);
-    expect(result.report?.reviewPriorities.at(-1)).toMatch(
-      /^有\d+条格式异常说明已忽略。$/u,
-    );
-    expect(serialized).not.toMatch(
-      /(?<![A-Za-z0-9_Ａ-Ｚａ-ｚ０-９＿])[PpUuＰｐＵｕ][\t\p{Zs}]*[0-9０-９]+(?![A-Za-z0-9_Ａ-Ｚａ-ｚ０-９＿])/u,
-    );
-  });
-
-  it("keeps an empty overview and never turns a truncated long token into P1", async () => {
-    const providerResult = {
-      summary: "未发现达到门槛的违规",
-      findings: [],
-      uncertainties: [
-        `${"甲".repeat(497)}P1234`,
-        `${"乙".repeat(497)}p1234A`,
-      ],
-      report: {
-        discussionOverview: "",
-        discussionMap: [],
-        participantDynamics: [],
-        borderlineCases: [],
-        normalHeatedDiscussion: [],
-        coverageNotes: [],
-        reviewPriorities: [],
-      },
-    };
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(responseFor(providerResult)));
-
-    const result = await analyzeWholeThreadWithCloud("截断边界", replies, {
-      endpoint: "https://provider.test/v1",
-      model: "test-model",
-      apiKey: "session-only-key",
-    });
-    const serialized = JSON.stringify(result);
-
-    expect(result.report?.discussionOverview).toBe("");
-    expect(result.uncertainties).toHaveLength(2);
-    expect(result.uncertainties.every((item) => item.endsWith("…"))).toBe(true);
-    expect(serialized).not.toContain("第 1 楼");
-    expect(serialized).not.toContain("P1234");
-    expect(serialized).not.toContain("p1234A");
-  });
-
-  it("maps a string report to its overview and ignores array/scalar reports", async () => {
-    const reports: unknown[] = [
-      "P1 与 U10 的长文概览",
-      [],
-      42,
-      true,
-      null,
-    ];
-
-    for (const report of reports) {
-      const providerResult = {
-        summary: "未发现达到门槛的违规",
-        findings: [],
-        uncertainties: [],
-        report,
-      };
-      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(responseFor(providerResult)));
-      const result = await analyzeWholeThreadWithCloud("报告兼容", replies, {
-        endpoint: "https://provider.test/v1",
-        model: "test-model",
-        apiKey: "session-only-key",
-      });
-
-      if (typeof report === "string") {
-        expect(result.report?.discussionOverview).toContain("第 1 楼");
-        expect(result.report?.discussionOverview).toContain("测试用户10");
-      } else {
-        expect(result.report).toBeUndefined();
-      }
+      assertV3(result);
+      expect(
+        result.report.stages.flatMap((item) => item.replyIds),
+        `run ${run}`,
+      ).not.toContain("reply-2");
+      expect(
+        result.report.interactions.flatMap((item) => item.replyIds),
+        `run ${run}`,
+      ).not.toContain("reply-2");
+      expect(JSON.stringify(result), `run ${run}`).not.toContain(secret);
     }
   });
 });

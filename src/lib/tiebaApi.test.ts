@@ -187,6 +187,56 @@ describe("Tieba API response projections", () => {
     expect(result.hasMore).toBe(false);
   });
 
+  it("diagnoses invalid and repeated page_pc ids instead of silently dropping nodes", () => {
+    const response = structuredClone(pagePcFixture);
+    const post = response.post_list[0]!;
+    const originalPreview = post.sub_post_list.sub_post_list[0]!;
+    const duplicatePreview = structuredClone(originalPreview);
+    const invalidPreview = structuredClone(originalPreview);
+    invalidPreview.id = "not-a-stable-id";
+    post.sub_post_list.sub_post_list.push(duplicatePreview, invalidPreview);
+
+    const duplicateMain = structuredClone(post);
+    duplicateMain.sub_post_number = "0";
+    duplicateMain.sub_post_list.sub_post_list = [];
+    const invalidMain = structuredClone(post);
+    invalidMain.id = "invalid-main-id";
+    invalidMain.sub_post_number = "1";
+    invalidMain.sub_post_list.sub_post_list = [
+      { ...structuredClone(originalPreview), id: "990100100099" },
+    ];
+    response.post_list.push(duplicateMain, invalidMain);
+
+    const result = parseTiebaPagePcResponse(response, {
+      threadId: "99000000001",
+      expectedPage: 1,
+    });
+
+    expect(result.replies.map((reply) => reply.id)).toEqual([
+      "990100000001",
+      "990100000002",
+      "990100100001",
+    ]);
+    expect(result).toMatchObject({
+      rawReplyNodeCount: 8,
+      stableReplyOccurrenceCount: 5,
+      duplicateStableIdCount: 2,
+      unparsedReplyCount: 3,
+    });
+  });
+
+  it("preserves a missing reply_num as unknown", () => {
+    const response = structuredClone(pagePcFixture);
+    delete (response.thread as { reply_num?: string }).reply_num;
+
+    expect(
+      parseTiebaPagePcResponse(response, {
+        threadId: "99000000001",
+        expectedPage: 1,
+      }).declaredReplyCount,
+    ).toBeNull();
+  });
+
   it("rejects remote errors, thread mixups and page mixups without echoing raw data", () => {
     expect(() =>
       parseTiebaPagePcResponse(
@@ -236,7 +286,13 @@ describe("Tieba nested HTML projection", () => {
       totalPages: 2,
       totalNum: 12,
       hasMore: true,
+      rawReplyNodeCount: 2,
+      stableReplyOccurrenceCount: 2,
+      duplicateStableIdCount: 0,
       unparsedReplyCount: 0,
+      unknownStructureCount: 0,
+      hasTrustedPager: true,
+      isOutOfRangeEmptyProbe: false,
     });
     expect(result.replies).toHaveLength(2);
     expect(result.replies[0]).toMatchObject({
@@ -263,6 +319,7 @@ describe("Tieba nested HTML projection", () => {
     const document = documentFrom(`
       <ul>
         <li class="lzl_single_post"><span class="lzl_content_main">缺少 id</span></li>
+        <li class="lzl_li_pager" data-field='{"total_num":"1","total_page":"1"}'></li>
       </ul>
     `);
     const result = parseTiebaNestedDocument(document, {
@@ -274,7 +331,140 @@ describe("Tieba nested HTML projection", () => {
       page: 1,
     });
     expect(result.replies).toEqual([]);
-    expect(result.unparsedReplyCount).toBe(1);
+    expect(result).toMatchObject({
+      rawReplyNodeCount: 1,
+      stableReplyOccurrenceCount: 0,
+      duplicateStableIdCount: 0,
+      unparsedReplyCount: 1,
+      unknownStructureCount: 0,
+    });
+  });
+
+  it("does not treat a stable spid as readable without a canonical content container", () => {
+    const result = parseTiebaNestedDocument(
+      documentFrom(`
+        <ul>
+          <li class="lzl_single_post" data-field='{"spid":"990100100009"}'>残缺结构</li>
+          <li class="lzl_li_pager" data-field='{"total_num":"1","total_page":"1"}'></li>
+        </ul>
+      `),
+      {
+        threadId: "99000000001",
+        parentReplyId: "990100000002",
+        parentSiteReplyId: "990100000002",
+        parentFloor: 2,
+        sourcePage: 1,
+        page: 1,
+        declaredCount: 1,
+      },
+    );
+
+    expect(result.replies).toEqual([]);
+    expect(result).toMatchObject({
+      rawReplyNodeCount: 1,
+      stableReplyOccurrenceCount: 0,
+      unparsedReplyCount: 1,
+    });
+  });
+
+  it("rejects malformed or conflicting stable-id sources instead of guessing", () => {
+    const result = parseTiebaNestedDocument(
+      documentFrom(`
+        <ul>
+          <li class="lzl_single_post" data-field='not-json' data-spid="990100100030"><span class="lzl_content_main">损坏字段</span></li>
+          <li class="j_lzl_s_p" data-field='{"spid":"990100100031"}' data-spid="990100100032"><span class="lzl_content_main">冲突字段</span></li>
+          <div class="lzl_single_post" data-field='{"spid":"990100100033"}'><span class="lzl_content_main">错误标签</span></div>
+          <li class="lzl_li_pager" data-field='{"total_num":"3","total_page":"1"}'></li>
+        </ul>
+      `),
+      {
+        threadId: "99000000001",
+        parentReplyId: "990100000002",
+        parentSiteReplyId: "990100000002",
+        parentFloor: 2,
+        sourcePage: 1,
+        page: 1,
+        declaredCount: 3,
+      },
+    );
+
+    expect(result.replies).toEqual([]);
+    expect(result).toMatchObject({
+      rawReplyNodeCount: 2,
+      stableReplyOccurrenceCount: 0,
+      unparsedReplyCount: 2,
+      unknownStructureCount: 1,
+    });
+  });
+
+  it("diagnoses repeated stable ids and unknown data-field structures per page", () => {
+    const result = parseTiebaNestedDocument(
+      documentFrom(`
+        <ul>
+          <li class="lzl_single_post" data-field='{"spid":"990100100010"}'><span class="lzl_content_main"></span></li>
+          <li class="j_lzl_s_p" data-field='{"spid":"990100100010"}'><span class="lzl_content_main"></span></li>
+          <li class="future_nested_shape" data-field='{"spid":"990100100011"}'></li>
+          <li class="lzl_li_pager" data-field='{"total_num":"2","total_page":"1"}'></li>
+        </ul>
+      `),
+      {
+        threadId: "99000000001",
+        parentReplyId: "990100000002",
+        parentSiteReplyId: "990100000002",
+        parentFloor: 2,
+        sourcePage: 1,
+        page: 1,
+        declaredCount: 2,
+      },
+    );
+
+    expect(result.replies.map((reply) => reply.id)).toEqual([
+      "990100100010",
+    ]);
+    expect(result).toMatchObject({
+      rawReplyNodeCount: 2,
+      stableReplyOccurrenceCount: 2,
+      duplicateStableIdCount: 1,
+      unparsedReplyCount: 0,
+      unknownStructureCount: 1,
+      hasTrustedPager: true,
+    });
+  });
+
+  it("only accepts reply nodes that are direct siblings of the unique pager", () => {
+    const context = {
+      threadId: "99000000001",
+      parentReplyId: "990100000002",
+      parentSiteReplyId: "990100000002",
+      parentFloor: 2,
+      sourcePage: 1,
+      page: 1,
+      declaredCount: 1,
+    } as const;
+    const wrappedReply = parseTiebaNestedDocument(
+      documentFrom(`
+        <div class="unexpected_wrapper">
+          <li class="lzl_single_post" data-field='{"spid":"990100100020"}'>
+            <span class="lzl_content_main">不应被展平接受</span>
+          </li>
+        </div>
+        <li class="lzl_li_pager" data-field='{"total_num":"1","total_page":"1"}'></li>
+      `),
+      context,
+    );
+    expect(wrappedReply.replies).toEqual([]);
+    expect(wrappedReply.rawReplyNodeCount).toBe(0);
+    expect(wrappedReply.unknownStructureCount).toBeGreaterThan(0);
+
+    expect(() =>
+      parseTiebaNestedDocument(
+        documentFrom(`
+          <!-- <li class="lzl_single_post" data-field='{"spid":"990100100021"}'><span class="lzl_content_main">分片回复</span></li> -->
+          <!-- <li class="lzl_li_pager" data-field='{"total_num":"1","total_page":"1"}'></li> -->
+        `),
+        context,
+      ),
+    ).toThrowError(expect.objectContaining({ code: "INVALID_RESPONSE" }));
   });
 
   it("parses comment-wrapped legacy fragments and rejects empty challenge pages", () => {
@@ -301,10 +491,89 @@ describe("Tieba nested HTML projection", () => {
       content: "被注释包裹的回复",
     });
 
+    const terminalEmpty = parseTiebaNestedDocument(
+      documentFrom(`
+        <ul>
+          <li class="lzl_li_pager" data-field='{"total_num":"0","total_page":"1"}'></li>
+        </ul>
+      `),
+      context,
+    );
+    expect(terminalEmpty).toMatchObject({
+      replies: [],
+      totalNum: 0,
+      totalPages: 1,
+      hasMore: false,
+      rawReplyNodeCount: 0,
+      stableReplyOccurrenceCount: 0,
+      duplicateStableIdCount: 0,
+      unparsedReplyCount: 0,
+      unknownStructureCount: 0,
+      hasTrustedPager: true,
+      isOutOfRangeEmptyProbe: false,
+    });
+
+    const overrunSentinel = documentFrom(`
+      <li class="lzl_li_pager" data-field='{"total_num":null,"total_page":0}'>
+        <a href="#">我也说一句</a>
+      </li>
+    `);
+    expect(() =>
+      parseTiebaNestedDocument(overrunSentinel, context),
+    ).toThrowError(expect.objectContaining({ code: "INVALID_RESPONSE" }));
+    expect(
+      parseTiebaNestedDocument(overrunSentinel, {
+        ...context,
+        page: 2,
+        allowOutOfRangeEmptyProbe: true,
+      }),
+    ).toMatchObject({
+      currentPage: 2,
+      totalNum: 0,
+      totalPages: 0,
+      replies: [],
+      isOutOfRangeEmptyProbe: true,
+    });
+
+    for (const commentWrappedProbe of [
+      `<!-- <li class="lzl_li_pager" data-field='{"total_num":null,"total_page":0}'></li> -->`,
+      `<main>安全验证</main><!-- <li class="lzl_li_pager" data-field='{"total_num":null,"total_page":0}'></li> -->`,
+    ]) {
+      expect(() =>
+        parseTiebaNestedDocument(documentFrom(commentWrappedProbe), {
+          ...context,
+          page: 2,
+          allowOutOfRangeEmptyProbe: true,
+        }),
+      ).toThrowError(expect.objectContaining({ code: "INVALID_RESPONSE" }));
+    }
+
+    for (const unsafeProbe of [
+      `<div>安全验证</div><li class="lzl_li_pager" data-field='{"total_num":null,"total_page":0}'></li>`,
+      `<li class="future_nested_shape" data-field='{"spid":"990100100099"}'></li><li class="lzl_li_pager" data-field='{"total_num":null,"total_page":0}'></li>`,
+    ]) {
+      expect(() =>
+        parseTiebaNestedDocument(documentFrom(unsafeProbe), {
+          ...context,
+          page: 2,
+          allowOutOfRangeEmptyProbe: true,
+        }),
+      ).toThrowError(expect.objectContaining({ code: "INVALID_RESPONSE" }));
+    }
+
+    expect(() =>
+      parseTiebaNestedDocument(
+        documentFrom(
+          `<li class="lzl_li_pager" data-field='{"unexpected":"field"}'></li>`,
+        ),
+        context,
+      ),
+    ).toThrowError(expect.objectContaining({ code: "INVALID_RESPONSE" }));
+
     expect(() =>
       parseTiebaNestedDocument(
         documentFrom("<html><body>安全验证</body></html>"),
-        context,
+        { ...context, allowOutOfRangeEmptyProbe: true },
       ),
     ).toThrowError(expect.objectContaining({ code: "INVALID_RESPONSE" }));
   });

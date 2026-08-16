@@ -5,6 +5,7 @@ import { PERSISTENT_CLOUD_PERMISSION_ORIGINS } from "./lib/cloudPermission";
 
 interface ExtensionManifest {
   version: string;
+  minimum_chrome_version?: string;
   permissions?: string[];
   host_permissions?: string[];
   optional_host_permissions?: string[];
@@ -19,8 +20,9 @@ const manifest = JSON.parse(
 ) as ExtensionManifest;
 
 describe("extension manifest permission contract", () => {
-  it("ships version 0.3.1 with only the required extension permissions", () => {
-    expect(manifest.version).toBe("0.3.1");
+  it("ships version 1.0.0 with only the required extension permissions", () => {
+    expect(manifest.version).toBe("1.0.0");
+    expect(manifest.minimum_chrome_version).toBe("140");
     expect(manifest.permissions?.slice().sort()).toEqual(
       ["scripting", "sidePanel", "storage"].sort(),
     );

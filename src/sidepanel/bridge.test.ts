@@ -168,6 +168,7 @@ describe("runManagedCloudAnalysis", () => {
 
     await expect(
       runManagedCloudAnalysis(finding, [reply], {
+        provider: "alibaba",
         endpoint:
           "https://ws-7ee35od4h2zs6dft.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
         model: "qwen3.7-max",
@@ -191,7 +192,7 @@ describe("runManagedCloudAnalysis", () => {
     expect(remove).not.toHaveBeenCalled();
   });
 
-  it("先向后台声明 lease，再由确认点击申请权限并发起请求", async () => {
+  it("先向后台声明 lease，再核对 DeepSeek 固定权限并发起请求", async () => {
     const events: string[] = [];
     const starts: Array<Extract<CloudBrokerRequest, { type: "CLOUD_ANALYSIS_START" }>> = [];
     const messageListeners: Array<(message: CloudBrokerResponse) => void> = [];
@@ -224,17 +225,19 @@ describe("runManagedCloudAnalysis", () => {
       },
       disconnect: vi.fn(),
     };
-    const request = vi.fn(async () => {
-      events.push("permissions.request");
+    const contains = vi.fn(async () => {
+      events.push("permissions.contains");
       return true;
     });
+    const request = vi.fn();
     vi.stubGlobal("chrome", {
       runtime: { connect: vi.fn(() => port) },
-      permissions: { request },
+      permissions: { contains, request },
     });
 
     const promise = runManagedCloudAnalysis(finding, [reply], {
-      endpoint: "https://api.example.com/v1",
+      provider: "deepseek",
+      endpoint: "https://api.deepseek.com/chat/completions",
       model: "model",
       apiKey: "session-key",
       mode: "deep",
@@ -245,18 +248,19 @@ describe("runManagedCloudAnalysis", () => {
 
     expect(events).toEqual([
       "CLOUD_PERMISSION_PREPARE",
-      "permissions.request",
+      "permissions.contains",
     ]);
     await expect(promise).resolves.toEqual(cloudResult);
     expect(events).toEqual([
       "CLOUD_PERMISSION_PREPARE",
-      "permissions.request",
+      "permissions.contains",
       "beforeStart",
       "CLOUD_ANALYSIS_START",
     ]);
-    expect(request).toHaveBeenCalledWith({
-      origins: ["https://api.example.com/*"],
+    expect(contains).toHaveBeenCalledWith({
+      origins: ["https://api.deepseek.com/*"],
     });
+    expect(request).not.toHaveBeenCalled();
     expect(port.disconnect).toHaveBeenCalled();
     expect(starts).toHaveLength(1);
     expect(starts[0]?.mode).toBe("deep");
@@ -274,12 +278,16 @@ describe("runManagedCloudAnalysis", () => {
     };
     vi.stubGlobal("chrome", {
       runtime: { connect: vi.fn(() => port) },
-      permissions: { request: vi.fn().mockResolvedValue(false) },
+      permissions: {
+        contains: vi.fn().mockResolvedValue(false),
+        request: vi.fn(),
+      },
     });
 
     await expect(
       runManagedCloudAnalysis(finding, [reply], {
-        endpoint: "https://api.example.com/v1",
+        provider: "deepseek",
+        endpoint: "https://api.deepseek.com/chat/completions",
         model: "model",
         apiKey: "session-key",
       }),
@@ -306,13 +314,14 @@ describe("runManagedCloudAnalysis", () => {
       permissions: {
         request: vi.fn().mockResolvedValue(true),
         remove: vi.fn().mockResolvedValue(true),
-        contains: vi.fn().mockResolvedValue(false),
+        contains: vi.fn().mockResolvedValue(true),
       },
     });
 
     await expect(
       runManagedCloudAnalysis(finding, [reply], {
-        endpoint: "https://api.example.com/v1",
+        provider: "deepseek",
+        endpoint: "https://api.deepseek.com/chat/completions",
         model: "model",
         apiKey: "session-key",
         beforeStart: async () => {
@@ -327,14 +336,14 @@ describe("runManagedCloudAnalysis", () => {
     ]);
   });
 
-  it("切页中止后权限弹窗才允许时会撤销迟到的授权", async () => {
+  it("切页中止后迟到的固定权限核对也不会启动请求", async () => {
     const sent: CloudBrokerRequest[] = [];
-    let resolvePermission!: (granted: boolean) => void;
+    let resolveContains!: (granted: boolean) => void;
     const permission = new Promise<boolean>((resolve) => {
-      resolvePermission = resolve;
+      resolveContains = resolve;
     });
     const remove = vi.fn().mockResolvedValue(true);
-    const contains = vi.fn().mockResolvedValue(false);
+    const contains = vi.fn(() => permission);
     const port = {
       onMessage: { addListener: vi.fn() },
       onDisconnect: { addListener: vi.fn() },
@@ -346,32 +355,31 @@ describe("runManagedCloudAnalysis", () => {
     vi.stubGlobal("chrome", {
       runtime: { connect: vi.fn(() => port) },
       permissions: {
-        request: vi.fn(() => permission),
+        request: vi.fn(),
         remove,
         contains,
       },
     });
     const controller = new AbortController();
     const analysis = runManagedCloudAnalysis(finding, [reply], {
-      endpoint: "https://api.example.com/v1",
+      provider: "deepseek",
+      endpoint: "https://api.deepseek.com/chat/completions",
       model: "model",
       apiKey: "session-key",
       signal: controller.signal,
     });
 
     controller.abort();
-    resolvePermission(true);
+    resolveContains(true);
 
     await expect(analysis).rejects.toThrow("云端请求已取消");
     expect(sent.map((message) => message.type)).toEqual([
       "CLOUD_PERMISSION_PREPARE",
       "CLOUD_ANALYSIS_CANCEL",
     ]);
-    expect(remove).toHaveBeenCalledWith({
-      origins: ["https://api.example.com/*"],
-    });
+    expect(remove).not.toHaveBeenCalled();
     expect(contains).toHaveBeenCalledWith({
-      origins: ["https://api.example.com/*"],
+      origins: ["https://api.deepseek.com/*"],
     });
   });
 });
@@ -397,6 +405,7 @@ describe("runManagedWholeThreadCloudAnalysis", () => {
     });
 
     const analysis = runManagedWholeThreadCloudAnalysis("测试帖子", [reply], {
+      provider: "alibaba",
       endpoint:
         "https://ws-7ee35od4h2zs6dft.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
       model: "qwen3.7-max",
@@ -453,6 +462,7 @@ describe("runManagedWholeThreadCloudAnalysis", () => {
 
     await expect(
       runManagedWholeThreadCloudAnalysis("不得发送的标题", [reply], {
+        provider: "alibaba",
         endpoint:
           "https://ws-7ee35od4h2zs6dft.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
         model: "qwen3.7-max",
@@ -483,6 +493,7 @@ describe("runManagedWholeThreadCloudAnalysis", () => {
 
     await expect(
       runManagedWholeThreadCloudAnalysis("测试帖子", [reply], {
+        provider: "deepseek",
         endpoint: "https://api.deepseek.com/chat/completions",
         model: "deepseek-v4-pro",
         apiKey: "session-key",
@@ -515,13 +526,14 @@ describe("runManagedWholeThreadCloudAnalysis", () => {
 
     await expect(
       runManagedWholeThreadCloudAnalysis("测试帖子", [reply], {
+        provider: "deepseek",
         endpoint: "https://api.example.com/v1",
         model: "model",
         apiKey: "session-key",
         beforeStart,
         analyze,
       }),
-    ).rejects.toThrow("仅支持已固定授权");
+    ).rejects.toThrow("与所选服务商不匹配");
     expect(contains).not.toHaveBeenCalled();
     expect(analyze).not.toHaveBeenCalled();
     expect(beforeStart).not.toHaveBeenCalled();
@@ -546,6 +558,7 @@ describe("runManagedWholeThreadCloudAnalysis", () => {
 
     await expect(
       runManagedWholeThreadCloudAnalysis("测试帖子", [reply], {
+        provider: "alibaba",
         endpoint,
         model: "qwen3.7-max",
         apiKey: "session-key",
@@ -560,6 +573,7 @@ describe("runManagedWholeThreadCloudAnalysis", () => {
     controller.abort();
     await expect(
       runManagedWholeThreadCloudAnalysis("测试帖子", [reply], {
+        provider: "alibaba",
         endpoint,
         model: "qwen3.7-max",
         apiKey: "session-key",

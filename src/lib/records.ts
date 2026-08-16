@@ -77,6 +77,15 @@ const reasonIdSchema = z.string().trim().refine(
   (value) => Boolean(getReasonById(value)),
   "primaryReasonId 必须来自当前规范理由库",
 );
+const analysisAttemptIdSchema = z
+  .string()
+  .trim()
+  .regex(/^[A-Za-z0-9:_-]{1,128}$/u);
+const snapshotIdSchema = z.string().regex(/^[a-f0-9]{64}$/u);
+const findingIdSchema = z
+  .string()
+  .trim()
+  .regex(/^[A-Za-z0-9:_-]{1,200}$/u);
 
 const analyzerVersionsSchema = z.strictObject({
   // `disabled` marks API-only reviews without pretending the former local
@@ -98,6 +107,9 @@ const reviewRecordSchema = z
     primaryReasonId: reasonIdSchema.nullable(),
     internalTags: z.array(internalTag).max(16),
     reviewedAt: isoDateTime,
+    analysisAttemptId: analysisAttemptIdSchema.nullable().optional(),
+    snapshotId: snapshotIdSchema.nullable().optional(),
+    findingId: findingIdSchema.nullable().optional(),
     analyzerVersions: analyzerVersionsSchema,
   })
   .superRefine((record, context) => {

@@ -1,7 +1,7 @@
 {
   "name": "kamen-rider-tieba-reviewer",
   "private": true,
-  "version": "0.3.1",
+  "version": "1.0.0",
   "type": "module",
   "engines": {
     "node": "^20.19.0 || >=22.12.0"
@@ -13,7 +13,9 @@
     "evaluate:example": "vite-node scripts/evaluate-corpus.ts evaluation/corpus.example.json --allow-small",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "release:package": "npm run build && node scripts/package-release.mjs",
+    "release:verify": "npm test && npm run release:package"
   },
   "dependencies": {
     "react": "^19.1.1",

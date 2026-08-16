@@ -42,6 +42,26 @@ export function normalizeCloudProvider(
   return DEFAULT_CLOUD_PROVIDER;
 }
 
+/**
+ * Binds a provider credential to its reviewed endpoint. Legacy values on the
+ * same official origin are normalized to the current canonical path; another
+ * origin is rejected before any permission request or provider fetch.
+ */
+export function canonicalCloudProviderEndpoint(
+  provider: CloudProvider,
+  endpoint: unknown,
+): string {
+  const canonical = persistableCloudEndpoint(
+    CLOUD_PROVIDER_DEFAULTS[provider].endpoint,
+  );
+  if (typeof endpoint !== "string" || !endpoint.trim()) return canonical;
+  const candidate = persistableCloudEndpoint(endpoint);
+  if (new URL(candidate).origin !== new URL(canonical).origin) {
+    throw new Error("云端 endpoint 与所选服务商不匹配。");
+  }
+  return canonical;
+}
+
 export function isPersistentCloudPermissionOrigin(origin: string): boolean {
   return PERSISTENT_CLOUD_PERMISSION_ORIGINS.some(
     (allowed) => allowed === origin,
@@ -91,8 +111,8 @@ const SENSITIVE_QUERY_KEYS = new Set([
 
 /**
  * Validates the endpoint string before it enters durable local storage.
- * Provider credentials belong in the session-only API-key field, never in a
- * URL user-info segment, fragment, or credential-shaped query parameter.
+ * Provider credentials belong in their provider-scoped secret record, never
+ * in a URL user-info segment, fragment, or credential-shaped query parameter.
  */
 export function persistableCloudEndpoint(endpoint: string): string {
   const trimmed = endpoint.trim();

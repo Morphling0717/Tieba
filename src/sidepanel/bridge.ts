@@ -16,10 +16,11 @@ import {
   type WholeThreadCloudAnalysisResult,
 } from "../lib/cloud";
 import {
+  canonicalCloudProviderEndpoint,
   endpointPermissionPattern,
   isPersistentCloudPermissionOrigin,
 } from "../lib/cloudPermission";
-import type { CapturedReply, Finding } from "../types";
+import type { CapturedReply, CloudProvider, Finding } from "../types";
 
 export class ExtensionRequestError extends Error {
   constructor(
@@ -111,6 +112,7 @@ export async function getActiveTabId(): Promise<number | null> {
 export { endpointPermissionPattern } from "../lib/cloudPermission";
 
 export interface ManagedCloudAnalysisOptions {
+  provider: CloudProvider;
   endpoint: string;
   model: string;
   apiKey: string;
@@ -122,6 +124,8 @@ export interface ManagedCloudAnalysisOptions {
 
 export interface ManagedWholeThreadCloudAnalysisOptions
   extends ManagedCloudAnalysisOptions {
+  /** Runs at the last local boundary immediately before the provider fetch. */
+  beforeSend?: () => Promise<void> | void;
   /** Test seam; production callers use the real side-panel implementation. */
   analyze?: typeof analyzeWholeThreadWithCloud;
 }
@@ -142,7 +146,11 @@ export async function runManagedCloudAnalysis(
   replies: CapturedReply[],
   options: ManagedCloudAnalysisOptions,
 ): Promise<CloudAnalysisResult> {
-  const origin = endpointPermissionPattern(options.endpoint);
+  const endpoint = canonicalCloudProviderEndpoint(
+    options.provider,
+    options.endpoint,
+  );
+  const origin = endpointPermissionPattern(endpoint);
   const persistentPermission = isPersistentCloudPermissionOrigin(origin);
   const id = requestId();
   const port = chrome.runtime.connect({ name: CLOUD_ANALYSIS_PORT_NAME });
@@ -193,7 +201,7 @@ export async function runManagedCloudAnalysis(
   port.postMessage({
     type: "CLOUD_PERMISSION_PREPARE",
     requestId: id,
-    endpoint: options.endpoint,
+    endpoint,
   } satisfies CloudBrokerRequest);
 
   // This call happens synchronously in the user's confirmation click stack.
@@ -211,7 +219,7 @@ export async function runManagedCloudAnalysis(
     port.postMessage({
       type: "CLOUD_ANALYSIS_START",
       requestId: id,
-      endpoint: options.endpoint,
+      endpoint,
       model: options.model,
       apiKey: options.apiKey,
       mode: options.mode,
@@ -273,7 +281,11 @@ export async function runManagedWholeThreadCloudAnalysis(
   replies: CapturedReply[],
   options: ManagedWholeThreadCloudAnalysisOptions,
 ): Promise<WholeThreadCloudAnalysisResult> {
-  const origin = endpointPermissionPattern(options.endpoint);
+  const endpoint = canonicalCloudProviderEndpoint(
+    options.provider,
+    options.endpoint,
+  );
+  const origin = endpointPermissionPattern(endpoint);
   if (!isPersistentCloudPermissionOrigin(origin)) {
     throw new Error(
       "自动整帖分析仅支持已固定授权的 AI 服务商端点，请检查云端设置。",
@@ -299,11 +311,12 @@ export async function runManagedWholeThreadCloudAnalysis(
   // same signal supplied by App.
   const analyze = options.analyze ?? analyzeWholeThreadWithCloud;
   const config = {
-    endpoint: options.endpoint,
+    endpoint,
     model: options.model,
     apiKey: options.apiKey,
     mode: options.mode,
     signal: options.signal,
+    beforeSend: options.beforeSend,
   } satisfies CloudAnalysisConfig;
   return analyze(threadTitle, replies, config);
 }

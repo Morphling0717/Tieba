@@ -142,7 +142,7 @@ function hasSafeNonNavigatingHref(element: Element): boolean {
 
 function semanticClickable(element: Element): HTMLElement | null {
   const clickable = element.closest<HTMLElement>(
-    "button, [role='button'], [role='tab'], a, [class*='sort-item'], [class*='order-item'], [class*='more'], [class*='expand'], [class*='unfold']",
+    "button, [role='button'], [role='tab'], a, .sub-tab-item, [class*='sort-item'], [class*='order-item'], [class*='more'], [class*='expand'], [class*='unfold']",
   );
   if (!clickable || controlIsDisabledOrHidden(clickable)) return null;
   if (

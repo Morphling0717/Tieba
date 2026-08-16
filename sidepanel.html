@@ -3,7 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="light" />
+    <meta name="color-scheme" content="light dark" />
+    <style>
+      html, body { background: #f5f6fa; }
+      @media (prefers-color-scheme: dark) {
+        html, body { background: #080808; }
+      }
+    </style>
     <title>长帖审阅助手</title>
   </head>
   <body>

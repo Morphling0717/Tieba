@@ -1,4 +1,6 @@
 import type {
+  CaptureProgressMessage,
+  CaptureProgressPhase,
   ContentRequest,
   DynamicContentChangedMessage,
   EvidenceLocator,
@@ -10,6 +12,8 @@ import type {
   SessionClearedMessage,
   SessionSuspendedMessage,
   SessionUpdatedMessage,
+  TabReviewContext,
+  ValidatedReviewSnapshot,
 } from "./messages";
 import {
   classifySessionUrl,
@@ -36,6 +40,18 @@ import {
 } from "./lib/tiebaApi";
 import type { TiebaTransportResponse } from "./lib/tiebaTransport";
 
+// Restrict durable settings (including provider-scoped API credentials) before
+// this worker injects any content script. The side panel repeats this check and
+// fails closed before reading or writing a credential.
+if (typeof chrome.storage.local?.setAccessLevel === "function") {
+  void chrome.storage.local.setAccessLevel({
+    accessLevel: "TRUSTED_CONTEXTS",
+  }).catch(() => {
+    // The side panel will surface a credential-storage error if the restriction
+    // still cannot be applied when a key is needed.
+  });
+}
+
 const cloudBroker =
   typeof chrome.permissions?.remove === "function" &&
   typeof chrome.permissions?.contains === "function" &&
@@ -49,7 +65,6 @@ const cloudBroker =
       })
     : null;
 
-const PENDING_JUMP_MAX_AGE_MS = 2 * 60 * 1_000;
 const dynamicCaptureQueues = new Map<number, Promise<void>>();
 const lastDynamicSignatures = new Map<
   number,
@@ -57,18 +72,15 @@ const lastDynamicSignatures = new Map<
 >();
 const captureGenerations = new Map<number, number>();
 const suspendedTabs = new Set<number>();
-const apiCaptureTokens = new Map<number, symbol>();
-const jumpRoutingTokens = new Map<number, symbol>();
-const jumpNavigationQueues = new Map<number, Promise<void>>();
-
-interface PendingJump {
-  threadId: string;
-  locator: EvidenceLocator;
-  createdAt: number;
+interface ActiveApiCapture {
+  token: symbol;
+  requestId: string;
+  promise: Promise<ReviewSession>;
 }
-
-const pendingJumpStorageKey = (tabId: number): string =>
-  `kr_tieba_pending_jump_${tabId}`;
+const activeApiCaptures = new Map<number, ActiveApiCapture>();
+const captureProgressByTab = new Map<number, CaptureProgressMessage>();
+const jumpRoutingTokens = new Map<number, symbol>();
+let generatedCaptureRequestId = 0;
 const suspendedSessionStorageKey = (tabId: number): string =>
   `kr_tieba_session_suspended_${tabId}`;
 
@@ -78,6 +90,73 @@ function captureGeneration(tabId: number): number {
 
 function bumpCaptureGeneration(tabId: number): void {
   captureGenerations.set(tabId, captureGeneration(tabId) + 1);
+}
+
+function nextCaptureRequestId(): string {
+  generatedCaptureRequestId += 1;
+  return `capture-${Date.now().toString(36)}-${generatedCaptureRequestId.toString(36)}`;
+}
+
+function normalizeCaptureRequestId(requestId: string | undefined): string {
+  if (requestId === undefined) return nextCaptureRequestId();
+  const normalized = requestId.trim();
+  if (!normalized || normalized.length > 128) {
+    throw new ExtensionOperationError("整帖读取请求标识无效。", "UNKNOWN");
+  }
+  return normalized;
+}
+
+function publishCaptureProgress(
+  tabId: number,
+  requestId: string,
+  phase: CaptureProgressPhase,
+  completed: number,
+  total: number,
+  status: CaptureProgressMessage["status"] = "running",
+): void {
+  const progress: CaptureProgressMessage = {
+    type: "CAPTURE_PROGRESS",
+    tabId,
+    requestId,
+    phase,
+    completed,
+    total,
+    status,
+  };
+  const previous = captureProgressByTab.get(tabId);
+  if (
+    previous?.requestId === requestId &&
+    previous.phase === phase &&
+    previous.completed === completed &&
+    previous.total === total &&
+    previous.status === status
+  ) {
+    return;
+  }
+  captureProgressByTab.set(tabId, progress);
+  void chrome.runtime.sendMessage(progress).catch(() => undefined);
+}
+
+function cancelApiCapture(tabId: number, requestId?: string): boolean {
+  const active = activeApiCaptures.get(tabId);
+  if (!active || (requestId !== undefined && active.requestId !== requestId)) {
+    return false;
+  }
+  // Invalidate persistence synchronously as well as the request checkpoint.
+  // Otherwise a cancel arriving after the final checkpoint but before
+  // saveSession can still commit the already-built snapshot.
+  bumpCaptureGeneration(tabId);
+  activeApiCaptures.delete(tabId);
+  const previous = captureProgressByTab.get(tabId);
+  publishCaptureProgress(
+    tabId,
+    active.requestId,
+    previous?.requestId === active.requestId ? previous.phase : "validation",
+    previous?.requestId === active.requestId ? previous.completed : 0,
+    previous?.requestId === active.requestId ? previous.total : 1,
+    "cancelled",
+  );
+  return true;
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -90,6 +169,26 @@ async function activeTab(): Promise<chrome.tabs.Tab> {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) {
     throw new ExtensionOperationError("找不到当前标签页", "UNKNOWN");
+  }
+  return tab;
+}
+
+async function tabById(tabId: number): Promise<chrome.tabs.Tab | null> {
+  if (!Number.isInteger(tabId) || tabId <= 0) return null;
+  try {
+    return await chrome.tabs.get(tabId);
+  } catch {
+    return null;
+  }
+}
+
+async function requiredTabById(tabId: number): Promise<chrome.tabs.Tab> {
+  const tab = await tabById(tabId);
+  if (!tab?.id) {
+    throw new ExtensionOperationError(
+      "指定标签页已关闭或不可访问。",
+      "SESSION_STALE",
+    );
   }
   return tab;
 }
@@ -245,15 +344,13 @@ async function clearSession(
   tabId: number,
   reason: SessionClearedMessage["reason"],
 ): Promise<void> {
-  // Invalidate an in-flight official fallback synchronously, before the first
-  // storage await. Otherwise a delayed pending write could resume after the
-  // user has left and navigate the tab back to the previous thread.
+  // Invalidate in-flight capture and evidence lookup work synchronously,
+  // before the first storage await.
   jumpRoutingTokens.delete(tabId);
-  apiCaptureTokens.delete(tabId);
+  cancelApiCapture(tabId);
   bumpCaptureGeneration(tabId);
   await chrome.storage.session.remove(sessionStorageKey(tabId));
   await chrome.storage.session.remove(threadCloudCacheStorageKey(tabId));
-  await chrome.storage.session.remove(pendingJumpStorageKey(tabId));
   await chrome.storage.session.remove(suspendedSessionStorageKey(tabId));
   suspendedTabs.delete(tabId);
   lastDynamicSignatures.delete(tabId);
@@ -261,33 +358,12 @@ async function clearSession(
   void chrome.runtime.sendMessage(update).catch(() => undefined);
 }
 
-async function loadPendingJump(tabId: number): Promise<PendingJump | null> {
-  const key = pendingJumpStorageKey(tabId);
-  const stored = await chrome.storage.session.get(key);
-  const pending = stored[key] as PendingJump | undefined;
-  if (!pending) return null;
-  if (Date.now() - pending.createdAt <= PENDING_JUMP_MAX_AGE_MS) return pending;
-  await chrome.storage.session.remove(key);
-  return null;
-}
-
-async function savePendingJump(
-  tabId: number,
-  pending: PendingJump,
-): Promise<void> {
-  await chrome.storage.session.set({ [pendingJumpStorageKey(tabId)]: pending });
-}
-
-async function clearPendingJump(tabId: number): Promise<void> {
-  await chrome.storage.session.remove(pendingJumpStorageKey(tabId));
-}
-
 function suspendSession(tabId: number): void {
   // tabs.onUpdated emits loading before the destination identity is reliable.
-  // Cancel any old-thread fallback immediately; the stored review session can
-  // remain suspended for a possible same-thread reload.
+  // Cancel old-thread work immediately; the stored review session can remain
+  // suspended for a possible user-initiated same-thread reload.
   jumpRoutingTokens.delete(tabId);
-  apiCaptureTokens.delete(tabId);
+  cancelApiCapture(tabId);
   bumpCaptureGeneration(tabId);
   lastDynamicSignatures.delete(tabId);
   suspendedTabs.add(tabId);
@@ -366,11 +442,102 @@ async function loadValidSession(
   return current;
 }
 
+async function tabReviewContext(tabId: number): Promise<TabReviewContext> {
+  const progress = captureProgressByTab.get(tabId) ?? null;
+  const tab = await tabById(tabId);
+  if (!tab) {
+    return {
+      tabId,
+      url: null,
+      threadId: null,
+      session: null,
+      captureProgress: progress,
+    };
+  }
+
+  const stored = await loadSession(tabId);
+  let url = tab.status === "loading" ? null : (tab.url ?? null);
+  if (
+    stored &&
+    tab.status !== "loading" &&
+    tiebaThreadIdFromUrl(tab.url) === stored.threadId
+  ) {
+    url =
+      (await resolveTabUrl(tab, { preferLiveLocation: true }).catch(
+        () => null,
+      )) ?? url;
+  }
+  const threadId = tiebaThreadIdFromUrl(url ?? undefined);
+  let session: ReviewSession | null = null;
+  if (stored && !(await isSessionSuspended(tabId))) {
+    const status = classifySessionUrl(stored, url);
+    if (status === "same") {
+      session = stored;
+    } else if (status === "different") {
+      await clearSession(tabId, "navigation");
+    }
+  }
+
+  return {
+    tabId,
+    url,
+    threadId,
+    session,
+    captureProgress: captureProgressByTab.get(tabId) ?? progress,
+  };
+}
+
+async function validateReviewSnapshot(
+  tabId: number,
+  threadId: string,
+  sessionUpdatedAt: string,
+): Promise<ValidatedReviewSnapshot> {
+  if (!/^\d+$/u.test(threadId) || !sessionUpdatedAt.trim()) {
+    throw new ExtensionOperationError(
+      "待验证的审阅快照标识无效。",
+      "SESSION_STALE",
+    );
+  }
+  const tab = await requiredTabById(tabId);
+  if (tab.status === "loading" || (await isSessionSuspended(tabId))) {
+    throw new ExtensionOperationError(
+      "帖子正在加载或审阅会话已暂停，请等待页面稳定后重试。",
+      "SESSION_STALE",
+    );
+  }
+  const stored = await loadSession(tabId);
+  if (!stored) {
+    throw new ExtensionOperationError(
+      "指定标签页没有可用的审阅会话。",
+      "SESSION_STALE",
+    );
+  }
+  const liveUrl = await resolveTabUrl(tab, {
+    throwOnFailure: true,
+    preferLiveLocation: true,
+  });
+  if (
+    !liveUrl ||
+    tiebaThreadIdFromUrl(liveUrl) !== threadId ||
+    stored.threadId !== threadId ||
+    stored.updatedAt !== sessionUpdatedAt ||
+    classifySessionUrl(stored, liveUrl) !== "same"
+  ) {
+    throw new ExtensionOperationError(
+      "帖子地址、帖子标识或审阅快照版本已经变化。",
+      "SESSION_STALE",
+    );
+  }
+  return { valid: true, session: stored };
+}
+
 interface CaptureTabOptions {
   expectedDocumentInstanceId?: string;
   expectedGeneration?: number;
   startDynamicCapture?: boolean;
+  additionalError?: string;
   additionalWarning?: string;
+  forceIncomplete?: boolean;
 }
 
 async function captureTab(
@@ -463,16 +630,24 @@ async function captureTab(
     }
   }
 
-  const captured =
-    options.additionalWarning === undefined
-      ? response.data
-      : {
-          ...response.data,
-          warnings: [
-            ...response.data.warnings,
-            options.additionalWarning,
-          ],
-        };
+  const captured: ThreadCapture = {
+    ...response.data,
+    coverage: options.forceIncomplete
+      ? {
+          ...response.data.coverage,
+          dynamicContentMayRemain: true,
+          isComplete: false,
+        }
+      : response.data.coverage,
+    errors:
+      options.additionalError === undefined
+        ? response.data.errors
+        : [...response.data.errors, options.additionalError],
+    warnings:
+      options.additionalWarning === undefined
+        ? response.data.warnings
+        : [...response.data.warnings, options.additionalWarning],
+  };
   const current = await loadSession(tab.id);
   const merged = mergeCapture(current, captured, tab.id);
   await saveSession(merged, expectedGeneration);
@@ -506,11 +681,17 @@ function extensionErrorInCauseChain(
 function normalizeWholeThreadError(error: unknown): ExtensionOperationError {
   const nested = extensionErrorInCauseChain(error);
   if (nested) {
-    if (
-      nested.code === "SESSION_STALE" ||
-      nested.code === "CAPTURE_CANCELLED"
-    ) {
-      return normalizeExtensionError(error, "CAPTURE_CANCELLED");
+    if (nested.code === "CAPTURE_CANCELLED") return nested;
+    if (nested.code === "SESSION_STALE") {
+      // Whole-thread persistence uses SESSION_STALE internally for generation
+      // mismatches, but its public operation was cancelled rather than merely
+      // superseded. Do not pass the existing error through normalizeExtensionError
+      // because that helper intentionally preserves an existing error code.
+      return new ExtensionOperationError(
+        "页面已切换、关闭或读取已取消，本次整帖结果未保存。",
+        "CAPTURE_CANCELLED",
+        { cause: error },
+      );
     }
     return nested;
   }
@@ -544,11 +725,14 @@ function isApiSessionForThread(
 
 async function captureWholeThread(
   tab: chrome.tabs.Tab,
+  requestId: string,
+  token: symbol,
 ): Promise<ReviewSession> {
   if (!tab.id) {
     throw new ExtensionOperationError("找不到当前标签页", "UNKNOWN");
   }
   const tabId = tab.id;
+  publishCaptureProgress(tabId, requestId, "validation", 0, 1);
   const currentUrl = await resolveTabUrl(tab, { throwOnFailure: true });
   if (!currentUrl) {
     throw new ExtensionOperationError(
@@ -561,12 +745,10 @@ async function captureWholeThread(
   assertTiebaThreadUrl(currentUrl);
   const threadId = tiebaThreadIdFromUrl(currentUrl)!;
   const expectedGeneration = captureGeneration(tabId);
-  const token = Symbol(`tieba-api-${tabId}`);
-  apiCaptureTokens.set(tabId, token);
 
   const checkpoint = async (): Promise<void> => {
     if (
-      apiCaptureTokens.get(tabId) !== token ||
+      activeApiCaptures.get(tabId)?.token !== token ||
       captureGeneration(tabId) !== expectedGeneration
     ) {
       throw new ExtensionOperationError(
@@ -579,10 +761,20 @@ async function captureWholeThread(
   try {
     await checkpoint();
     await ensureContentScript(tabId);
+    publishCaptureProgress(tabId, requestId, "validation", 1, 1);
     const capture = await captureTiebaThread({
       threadId,
       threadUrl: currentUrl,
       checkpoint,
+      onProgress: ({ phase, completed, total }) => {
+        publishCaptureProgress(
+          tabId,
+          requestId,
+          phase,
+          completed,
+          total,
+        );
+      },
       request: async (request: TiebaReadRequest): Promise<string> => {
         const response = await contentMessage<TiebaTransportResponse>(
           tabId,
@@ -684,16 +876,101 @@ async function captureWholeThread(
     if (isApiSessionForThread(prior, threadId)) {
       throw normalized;
     }
-    return captureTab(tab, {
-      expectedGeneration,
-      additionalWarning:
-        "整帖只读接口本次不可用，当前结果仅来自页面已挂载内容；请勿据此判定整帖安全。",
-    });
-  } finally {
-    if (apiCaptureTokens.get(tabId) === token) {
-      apiCaptureTokens.delete(tabId);
+    publishCaptureProgress(tabId, requestId, "coverage", 0, 1);
+    let fallback: ReviewSession;
+    try {
+      fallback = await captureTab(tab, {
+        expectedGeneration,
+        additionalError: `整帖只读接口失败：${normalized.message}`,
+        additionalWarning:
+          "仅保留当前页面已挂载内容供人工参考；这不是完整帖子快照。",
+        forceIncomplete: true,
+      });
+    } catch (fallbackError) {
+      const normalizedFallback = normalizeExtensionError(
+        fallbackError,
+        "PAGE_PARSE_FAILED",
+      );
+      if (
+        normalizedFallback.code === "CAPTURE_CANCELLED" ||
+        normalizedFallback.code === "SESSION_STALE"
+      ) {
+        throw normalizedFallback;
+      }
+      throw new ExtensionOperationError(
+        `整帖只读接口失败：${normalized.message}；页面局部读取也失败：${normalizedFallback.message}`,
+        normalizedFallback.code,
+        { cause: fallbackError },
+      );
     }
+    publishCaptureProgress(tabId, requestId, "coverage", 1, 1);
+    return fallback;
   }
+}
+
+function startWholeThreadCapture(
+  tab: chrome.tabs.Tab,
+  requestId: string,
+): Promise<ReviewSession> {
+  if (!tab.id) {
+    throw new ExtensionOperationError("找不到当前标签页", "UNKNOWN");
+  }
+  const tabId = tab.id;
+  const existing = activeApiCaptures.get(tabId);
+  if (existing) {
+    if (existing.requestId === requestId) return existing.promise;
+    throw new ExtensionOperationError(
+      "该标签页正在读取整帖，请等待完成或先取消当前读取。",
+      "UNKNOWN",
+    );
+  }
+
+  const token = Symbol(`tieba-api-${tabId}:${requestId}`);
+  const promise = captureWholeThread(tab, requestId, token)
+    .then((session) => {
+      const previous = captureProgressByTab.get(tabId);
+      publishCaptureProgress(
+        tabId,
+        requestId,
+        previous?.requestId === requestId ? previous.phase : "coverage",
+        previous?.requestId === requestId ? previous.completed : 1,
+        previous?.requestId === requestId ? previous.total : 1,
+        "complete",
+      );
+      return session;
+    })
+    .catch((error: unknown) => {
+      const previous = captureProgressByTab.get(tabId);
+      const nested = extensionErrorInCauseChain(error);
+      const cancelled =
+        nested?.code === "CAPTURE_CANCELLED" ||
+        nested?.code === "SESSION_STALE" ||
+        (error instanceof Error && error.name === "AbortError");
+      // A removed tab clears its progress, and a replacement request may have
+      // already installed newer progress. Never let this old promise recreate
+      // or overwrite either state when it eventually unwinds.
+      if (
+        activeApiCaptures.get(tabId)?.token === token ||
+        previous?.requestId === requestId
+      ) {
+        publishCaptureProgress(
+          tabId,
+          requestId,
+          previous?.requestId === requestId ? previous.phase : "validation",
+          previous?.requestId === requestId ? previous.completed : 0,
+          previous?.requestId === requestId ? previous.total : 1,
+          cancelled ? "cancelled" : "error",
+        );
+      }
+      throw error;
+    })
+    .finally(() => {
+      if (activeApiCaptures.get(tabId)?.token === token) {
+        activeApiCaptures.delete(tabId);
+      }
+    });
+  activeApiCaptures.set(tabId, { token, requestId, promise });
+  return promise;
 }
 
 function parserVariantForReply(
@@ -743,91 +1020,6 @@ function evidenceLocator(
   };
 }
 
-function isSameOfficialReplyUrl(
-  currentUrl: string | undefined,
-  target: URL,
-): boolean {
-  if (!currentUrl) return false;
-  try {
-    const current = new URL(currentUrl);
-    const normalizedTarget = new URL(target.href);
-    // Hash-only changes do not reload Tieba's SPA and therefore do not reset
-    // its in-memory hot/ascending/descending list. Compare the navigational
-    // part only and explicitly reload when it already points at this PID.
-    current.hash = "";
-    normalizedTarget.hash = "";
-    return current.href === normalizedTarget.href;
-  } catch {
-    return false;
-  }
-}
-
-async function navigateToOfficialReply(
-  tab: chrome.tabs.Tab,
-  session: ReviewSession,
-  locator: EvidenceLocator,
-  token: symbol,
-): Promise<void> {
-  const tabId = tab.id;
-  if (!tabId) {
-    throw new ExtensionOperationError(
-      "当前标签页已失效，请重新打开帖子后再试。",
-      "SESSION_STALE",
-    );
-  }
-  const targetPid = locator.isNested
-    ? locator.parentSiteReplyId
-    : locator.siteReplyId;
-  const threadId = session.threadId;
-  if (!threadId || !targetPid) {
-    throw new ExtensionOperationError(
-      "这条证据当前未加载，请继续滚动或展开回复后重试。",
-      "EVIDENCE_NOT_LOADED",
-    );
-  }
-  const target = new URL(
-    `/p/${encodeURIComponent(threadId)}`,
-    "https://tieba.baidu.com",
-  );
-  target.searchParams.set("pid", targetPid);
-  if (locator.isNested && locator.siteReplyId) {
-    target.searchParams.set("cid", locator.siteReplyId);
-    target.hash = locator.siteReplyId;
-  } else {
-    target.hash = targetPid;
-  }
-  await withJumpNavigationLock(tabId, async () => {
-    let pendingSaved = false;
-    try {
-      assertLatestJump(tabId, token);
-      await savePendingJump(tabId, {
-        threadId,
-        locator,
-        createdAt: Date.now(),
-      });
-      pendingSaved = true;
-      // A newer click can arrive while chrome.storage.session.set is pending.
-      // Check again before touching the tab. The per-tab navigation lock keeps
-      // the newer request from writing its pending locator until this stale
-      // one has removed its own record.
-      assertLatestJump(tabId, token);
-      if (isSameOfficialReplyUrl(tab.url, target)) {
-        // The three SPA sort modes share one URL. Updating a tab to its current
-        // ?pid URL is a no-op, leaving an unloaded target missing in another
-        // sort. A real reload lets Tieba's official PID route mount it again.
-        assertLatestJump(tabId, token);
-        await chrome.tabs.reload(tabId);
-      } else {
-        assertLatestJump(tabId, token);
-        await chrome.tabs.update(tabId, { url: target.href });
-      }
-    } catch (error) {
-      if (pendingSaved) await clearPendingJump(tabId);
-      throw error;
-    }
-  });
-}
-
 function assertLatestJump(tabId: number, token: symbol): void {
   if (jumpRoutingTokens.get(tabId) !== token) {
     throw new ExtensionOperationError(
@@ -837,33 +1029,11 @@ function assertLatestJump(tabId: number, token: symbol): void {
   }
 }
 
-async function withJumpNavigationLock<T>(
-  tabId: number,
-  operation: () => Promise<T>,
-): Promise<T> {
-  const previous = jumpNavigationQueues.get(tabId) ?? Promise.resolve();
-  let release!: () => void;
-  const current = new Promise<void>((resolve) => {
-    release = resolve;
-  });
-  const tail = previous.catch(() => undefined).then(() => current);
-  jumpNavigationQueues.set(tabId, tail);
-  await previous.catch(() => undefined);
-  try {
-    return await operation();
-  } finally {
-    release();
-    if (jumpNavigationQueues.get(tabId) === tail) {
-      jumpNavigationQueues.delete(tabId);
-    }
-  }
-}
-
 async function revalidateJumpContext(
   tabId: number,
   expectedThreadId: string | null,
   token: symbol,
-): Promise<{ tab: chrome.tabs.Tab; session: ReviewSession }> {
+): Promise<void> {
   assertLatestJump(tabId, token);
   const tab = await activeTab();
   assertLatestJump(tabId, token);
@@ -881,23 +1051,6 @@ async function revalidateJumpContext(
       "SESSION_STALE",
     );
   }
-  return { tab, session };
-}
-
-async function resumePendingJump(
-  tab: chrome.tabs.Tab,
-  session: ReviewSession,
-): Promise<void> {
-  if (!tab.id) return;
-  const pending = await loadPendingJump(tab.id);
-  if (!pending || pending.threadId !== session.threadId) return;
-  const response = await contentMessage<boolean>(tab.id, {
-    type: "JUMP_TO_REPLY",
-    locator: pending.locator,
-    expectedThreadId: pending.threadId,
-    waitForOfficialRoute: true,
-  });
-  if (response.ok) await clearPendingJump(tab.id);
 }
 
 function sessionDocumentInstanceId(session: ReviewSession): string | null {
@@ -1039,7 +1192,27 @@ async function routeRequest(
   message: ExtensionRequest,
 ): Promise<ExtensionResponse<unknown>> {
   if (message.type === "CAPTURE_WHOLE_THREAD") {
-    return { ok: true, data: await captureWholeThread(await activeTab()) };
+    const requestId = normalizeCaptureRequestId(message.requestId);
+    const tab =
+      message.tabId === undefined
+        ? await activeTab()
+        : await requiredTabById(message.tabId);
+    return { ok: true, data: await startWholeThreadCapture(tab, requestId) };
+  }
+  if (message.type === "CANCEL_CAPTURE") {
+    const requestId =
+      message.requestId === undefined
+        ? undefined
+        : normalizeCaptureRequestId(message.requestId);
+    const active = activeApiCaptures.get(message.tabId);
+    if (active && requestId !== undefined && active.requestId !== requestId) {
+      throw new ExtensionOperationError(
+        "整帖读取请求已经更新，旧取消请求未执行。",
+        "SESSION_STALE",
+      );
+    }
+    cancelApiCapture(message.tabId, requestId);
+    return { ok: true, data: null };
   }
   if (message.type === "CAPTURE_ACTIVE_PAGE") {
     return { ok: true, data: await captureTab(await activeTab()) };
@@ -1047,6 +1220,19 @@ async function routeRequest(
   if (message.type === "GET_ACTIVE_SESSION") {
     const tab = await activeTab();
     return { ok: true, data: await loadValidSession(tab) };
+  }
+  if (message.type === "GET_TAB_REVIEW_CONTEXT") {
+    return { ok: true, data: await tabReviewContext(message.tabId) };
+  }
+  if (message.type === "VALIDATE_REVIEW_SNAPSHOT") {
+    return {
+      ok: true,
+      data: await validateReviewSnapshot(
+        message.tabId,
+        message.threadId,
+        message.sessionUpdatedAt,
+      ),
+    };
   }
   if (message.type === "GET_CLOUD_PERMISSION_STATUS") {
     return { ok: true, data: await cloudBroker?.getCleanupStatus() ?? null };
@@ -1072,15 +1258,7 @@ async function routeRequest(
         "SESSION_STALE",
       );
     }
-    const pending = await loadPendingJump(tab.id!);
-    const isPendingRetry = Boolean(
-      pending &&
-      pending.threadId === session.threadId &&
-      pending.locator.replyId === message.replyId,
-    );
-    const locator =
-      evidenceLocator(session, message.replyId) ??
-      (isPendingRetry ? pending?.locator ?? null : null);
+    const locator = evidenceLocator(session, message.replyId);
     if (!locator) {
       throw new ExtensionOperationError(
         "这条证据不属于当前帖子会话",
@@ -1095,38 +1273,11 @@ async function routeRequest(
         type: "JUMP_TO_REPLY",
         locator,
         expectedThreadId,
-        waitForOfficialRoute: isPendingRetry,
       });
       assertLatestJump(tabId, token);
-      if (response.ok && isPendingRetry) {
-        await clearPendingJump(tabId);
-      }
-      if (
-        !response.ok &&
-        response.code === "EVIDENCE_NOT_LOADED" &&
-        (locator.isNested
-          ? locator.parserVariant === "api" &&
-            locator.siteReplyId &&
-            locator.parentSiteReplyId
-          : locator.siteReplyId) &&
-        !isPendingRetry
-      ) {
-        // The content script has already exhausted safe in-page scrolling,
-        // sort switching and expansion. Revalidate the active tab and session
-        // after that asynchronous work before using Tieba's official PID URL.
-        const current = await revalidateJumpContext(
-          tabId,
-          expectedThreadId,
-          token,
-        );
-        await navigateToOfficialReply(
-          current.tab,
-          current.session,
-          locator,
-          token,
-        );
-        return { ok: true, data: true };
-      }
+      // Card clicks are deliberately in-page only. Revalidate after the
+      // asynchronous scan, but never turn a miss into tabs.update/reload.
+      await revalidateJumpContext(tabId, expectedThreadId, token);
       return response;
     } finally {
       if (jumpRoutingTokens.get(tabId) === token) {
@@ -1141,6 +1292,7 @@ chrome.runtime.onMessage.addListener(
   (
     message:
       | ExtensionRequest
+      | CaptureProgressMessage
       | SessionUpdatedMessage
       | SessionClearedMessage
       | SessionSuspendedMessage,
@@ -1160,7 +1312,8 @@ chrome.runtime.onMessage.addListener(
     if (
       message.type === "SESSION_UPDATED" ||
       message.type === "SESSION_CLEARED" ||
-      message.type === "SESSION_SUSPENDED"
+      message.type === "SESSION_SUSPENDED" ||
+      message.type === "CAPTURE_PROGRESS"
     ) return;
     void routeRequest(message)
       .then(sendResponse)
@@ -1217,15 +1370,13 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
       try {
         await clearSessionSuspension(tabId, expectedGeneration);
         broadcastSessionUpdated(current);
-        await resumePendingJump(tab, current);
       } catch {
         // A newer navigation won the race; leave the session suspended.
       }
       return;
     }
     try {
-      const session = await captureTab(tab);
-      await resumePendingJump(tab, session);
+      await captureTab(tab);
     } catch {
       // Navigation may leave Tieba or revoke activeTab. The user can explicitly
       // click the action again; no background fetch or retry is attempted.
@@ -1234,15 +1385,16 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  apiCaptureTokens.delete(tabId);
+  // Keep a generation tombstone for work that may still be awaiting a content
+  // response or storage write. Deleting it would turn the generation back to
+  // zero and could make an old capture valid again after this handler returns.
+  if (!cancelApiCapture(tabId)) bumpCaptureGeneration(tabId);
+  captureProgressByTab.delete(tabId);
   jumpRoutingTokens.delete(tabId);
-  jumpNavigationQueues.delete(tabId);
   void chrome.storage.session.remove(sessionStorageKey(tabId));
   void chrome.storage.session.remove(threadCloudCacheStorageKey(tabId));
-  void chrome.storage.session.remove(pendingJumpStorageKey(tabId));
   void chrome.storage.session.remove(suspendedSessionStorageKey(tabId));
   dynamicCaptureQueues.delete(tabId);
   lastDynamicSignatures.delete(tabId);
-  captureGenerations.delete(tabId);
   suspendedTabs.delete(tabId);
 });

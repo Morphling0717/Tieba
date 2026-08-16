@@ -41,6 +41,12 @@ describe("review record validation", () => {
       },
     });
     expect(validateReviewRecord(apiOnlyRecord)).toEqual(apiOnlyRecord);
+    const linkedRecord = record({
+      analysisAttemptId: "00000000-0000-4000-8000-000000000099",
+      snapshotId: "a".repeat(64),
+      findingId: "AI-1-1-personal_attack-101",
+    });
+    expect(validateReviewRecord(linkedRecord)).toEqual(linkedRecord);
 
     const missing = { ...record() } as Record<string, unknown>;
     delete missing.threadUrl;
@@ -50,6 +56,9 @@ describe("review record validation", () => {
     ).toThrow();
     expect(() =>
       validateReviewRecord({ ...record(), threadId: "999" }),
+    ).toThrow();
+    expect(() =>
+      validateReviewRecord({ ...record(), snapshotId: "raw-thread-text" }),
     ).toThrow();
   });
 

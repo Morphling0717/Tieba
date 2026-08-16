@@ -41,7 +41,7 @@ export function normalizeExtensionError(
     )
   ) {
     return new ExtensionOperationError(
-      "未获得百度贴吧页面读取权限。请在扩展管理页重新加载 0.3.1，并允许访问 tieba.baidu.com。",
+      "未获得百度贴吧页面读取权限。请在扩展管理页重新加载当前版本，并允许访问 tieba.baidu.com。",
       "TIEBA_PERMISSION_MISSING",
       { cause: error },
     );
